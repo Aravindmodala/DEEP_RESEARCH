@@ -1,0 +1,15 @@
+langgraph
+langchain
+langchain-core
+langchain-openai
+tavily-python
+python-dotenv
+pydantic
+
+
+langchain-core
+langchain-openai
+tavily-python
+python-dotenv
+pydantic
+
