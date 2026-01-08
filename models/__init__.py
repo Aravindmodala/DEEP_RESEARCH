@@ -3,6 +3,7 @@
 from .schemas import (
     ReportOutput,
     SourceReference,
+    Competitor,
     ExecutiveSummary,
     CompetitiveLandscapeSection,
     MenuPricingSection,
@@ -14,6 +15,7 @@ from .schemas import (
 __all__ = [
     "ReportOutput",
     "SourceReference",
+    "Competitor",
     "ExecutiveSummary",
     "CompetitiveLandscapeSection",
     "MenuPricingSection",
