@@ -37,3 +37,6 @@ rich>=13.7.0
 
 # Utilities
 tenacity>=8.2.0
+
+# UI / Dashboard
+streamlit>=1.36.0
