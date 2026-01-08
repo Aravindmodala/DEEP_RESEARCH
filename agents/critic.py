@@ -149,11 +149,11 @@ class CriticAgent:
                     "description": "Sentiment analysis missing",
                     "affected_section": "sentiment_analysis",
                 })
-            elif not sentiment_analysis.get("positive_drivers") and not sentiment_analysis.get("common_complaints"):
+            elif not sentiment_analysis.get("restaurants") and not sentiment_analysis.get("raw_reviews"):
                 issues.append({
                     "severity": "minor",
                     "category": "completeness",
-                    "description": "Sentiment analysis lacks specific themes",
+                    "description": "Sentiment analysis lacks restaurant reviews",
                     "affected_section": "sentiment_analysis",
                 })
 
@@ -292,7 +292,7 @@ Evaluate this research for commercial banking suitability. Output your evaluatio
             completeness_bonus += 0.05
         if menu_comparison and menu_comparison.get("target_menu"):
             completeness_bonus += 0.05
-        if sentiment_analysis and sentiment_analysis.get("target_overall_sentiment"):
+        if sentiment_analysis and sentiment_analysis.get("restaurants"):
             completeness_bonus += 0.05
         if market_signals and market_signals.get("competitor_density"):
             completeness_bonus += 0.05
@@ -319,8 +319,8 @@ Evaluate this research for commercial banking suitability. Output your evaluatio
         if menu_comparison and menu_comparison.get("target_menu"):
             strengths.append("Target restaurant menu data extracted")
 
-        if sentiment_analysis and sentiment_analysis.get("sample_reviews"):
-            strengths.append("Customer sentiment backed by actual reviews")
+        if sentiment_analysis and sentiment_analysis.get("restaurants"):
+            strengths.append(f"LLM-analyzed sentiment for {len(sentiment_analysis['restaurants'])} restaurants")
 
         if market_signals and market_signals.get("market_saturation"):
             strengths.append("Market saturation assessment provided")

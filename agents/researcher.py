@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-from collections import Counter
 from datetime import datetime
 from typing import Any
 
@@ -25,7 +24,7 @@ class ResearcherAgent:
     NODE 2 — RESEARCHER AGENT (AUTONOMOUS)
     
     Executes research plan using ReAct loop.
-    Returns plain dict (no strict validation - Critic can handle flexible data).
+    Returns plain dict (no strict validation).
     """
 
     MAX_REACT_ITERATIONS = 15
@@ -78,9 +77,6 @@ class ResearcherAgent:
         """
         target = plan.get("target_restaurant", "Unknown")
         location = plan.get("location", "Unknown")
-        intent = plan.get("intent", "")
-        cuisine_type = plan.get("cuisine_type", "unknown")
-        search_queries = plan.get("search_queries", [])
         
         logger.info(f"[RESEARCHER] Starting research for {target}")
         logger.info(f"[RESEARCHER] Location: {location}")
@@ -94,8 +90,9 @@ class ResearcherAgent:
 
         # Track collected data
         collected_data = {
+            "target": None,
             "competitors": [],
-            "reviews": [],
+            "reviews": {},  # {restaurant_name: {"rating": 4.5, "review_count": 234, "reviews": [...]}}
             "menus": [],
             "market_data": [],
             "sources": [],
@@ -125,7 +122,7 @@ class ResearcherAgent:
                     tool = self.tool_map.get(tool_name)
                     if tool:
                         result = tool.invoke(tool_args)
-                        self._collect_data(collected_data, tool_name, result)
+                        self._collect_data(collected_data, tool_name, tool_args, result)
                         
                         collected_data["sources"].append({
                             "source_type": self._get_source_type(tool_name),
@@ -142,8 +139,11 @@ class ResearcherAgent:
 
                 messages.append(ToolMessage(content=str(result), tool_call_id=tool_id))
 
-        # Build output from collected data
-        output = self._build_output(collected_data, plan)
+        # Analyze sentiment using LLM for target + top 3 competitors
+        sentiment_analysis = self._analyze_sentiment_with_llm(collected_data)
+
+        # Build output
+        output = self._build_output(collected_data, plan, sentiment_analysis)
         
         logger.info(f"[RESEARCHER] Research complete. Found {len(output.get('competitors', []))} competitors")
         return output
@@ -157,7 +157,6 @@ class ResearcherAgent:
         queries = plan.get("search_queries", [])
         
         cuisine_info = f"**Cuisine Type:** {cuisine_type}" if cuisine_type != "unknown" else "**Cuisine Type:** (to be determined)"
-        
         queries_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(queries)])
         
         return f"""## Research Plan
@@ -172,11 +171,16 @@ class ResearcherAgent:
 
 ## IMPORTANT REQUIREMENTS:
 
-1. **Find competitors of the SAME cuisine type** ({cuisine_type or 'same as target'})
-2. **Scrape menus for TARGET + TOP 3 COMPETITORS**
-3. **Get reviews for target restaurant**
+1. **Find the target restaurant** using find_restaurant tool to get its place_id
+2. **Find competitors** of the SAME cuisine type using find_competitors
+3. **Get reviews for TARGET restaurant** using get_restaurant_reviews with the target's place_id
+4. **Get reviews for TOP 3 COMPETITORS** using get_restaurant_reviews for each
 
-Begin your research by first finding the target restaurant on Google Maps, then discovering nearby competitors."""
+The reviews are critical for sentiment analysis. Make sure to collect reviews for:
+- The target restaurant
+- At least 3 top-rated competitors
+
+Begin your research now."""
 
     def _get_source_type(self, tool_name: str) -> str:
         """Map tool name to source type."""
@@ -188,7 +192,7 @@ Begin your research by first finding the target restaurant on Google Maps, then 
             return "website_scrape"
         return "api"
 
-    def _collect_data(self, collected_data: dict, tool_name: str, result: Any) -> None:
+    def _collect_data(self, collected_data: dict, tool_name: str, tool_args: dict, result: Any) -> None:
         """Collect and organize data from tool results."""
         try:
             parsed = result
@@ -197,20 +201,48 @@ Begin your research by first finding the target restaurant on Google Maps, then 
                     try:
                         parsed = json.loads(result)
                     except:
-                        pass
+                        # Try eval for dict-like strings
+                        try:
+                            parsed = eval(result)
+                        except:
+                            pass
 
-            if "competitor" in tool_name.lower():
+            tool_lower = tool_name.lower()
+            
+            if "find_competitor" in tool_lower:
                 if isinstance(parsed, dict):
                     if "competitors" in parsed:
                         collected_data["competitors"].extend(parsed["competitors"])
                     if "target" in parsed and parsed["target"]:
                         collected_data["target"] = parsed["target"]
-            elif "review" in tool_name.lower():
+                        
+            elif "find_restaurant" in tool_lower:
+                if isinstance(parsed, dict) and parsed.get("name"):
+                    collected_data["target"] = parsed
+                    
+            elif "review" in tool_lower:
+                # Store reviews with restaurant identifier
                 if isinstance(parsed, list):
-                    collected_data["reviews"].extend(parsed)
-            elif "menu" in tool_name.lower():
+                    # Try to identify which restaurant these reviews are for
+                    place_id = tool_args.get("place_id", "unknown")
+                    
+                    # Find restaurant name from place_id
+                    restaurant_name = self._find_restaurant_name(collected_data, place_id)
+                    
+                    # Get rating from target or competitors
+                    rating_info = self._get_rating_info(collected_data, place_id)
+                    
+                    collected_data["reviews"][restaurant_name] = {
+                        "place_id": place_id,
+                        "rating": rating_info.get("rating"),
+                        "review_count": rating_info.get("review_count"),
+                        "reviews": parsed,
+                    }
+                    
+            elif "menu" in tool_lower:
                 collected_data["menus"].append(parsed)
-            elif "search" in tool_name.lower() or "market" in tool_name.lower():
+                
+            elif "search" in tool_lower or "market" in tool_lower:
                 if isinstance(parsed, list):
                     collected_data["market_data"].extend(parsed)
                 else:
@@ -219,12 +251,122 @@ Begin your research by first finding the target restaurant on Google Maps, then 
         except Exception as e:
             logger.warning(f"[RESEARCHER] Error collecting data: {e}")
 
-    def _build_output(self, collected_data: dict, plan: dict[str, Any]) -> dict[str, Any]:
+    def _find_restaurant_name(self, collected_data: dict, place_id: str) -> str:
+        """Find restaurant name from place_id."""
+        # Check target
+        if collected_data.get("target", {}).get("place_id") == place_id:
+            return collected_data["target"].get("name", "Target Restaurant")
+        
+        # Check competitors
+        for comp in collected_data.get("competitors", []):
+            if comp.get("place_id") == place_id:
+                return comp.get("name", "Unknown")
+        
+        return f"Restaurant_{place_id[:8]}"
+
+    def _get_rating_info(self, collected_data: dict, place_id: str) -> dict:
+        """Get rating info for a restaurant by place_id."""
+        # Check target
+        target = collected_data.get("target", {})
+        if target.get("place_id") == place_id:
+            return {
+                "rating": target.get("rating"),
+                "review_count": target.get("user_ratings_total") or target.get("review_count"),
+            }
+        
+        # Check competitors
+        for comp in collected_data.get("competitors", []):
+            if comp.get("place_id") == place_id:
+                return {
+                    "rating": comp.get("rating"),
+                    "review_count": comp.get("user_ratings_total") or comp.get("review_count"),
+                }
+        
+        return {}
+
+    def _analyze_sentiment_with_llm(self, collected_data: dict) -> dict[str, Any]:
+        """
+        Use LLM to analyze sentiment from ratings and reviews.
+        Analyzes target + competitors.
+        """
+        reviews_data = collected_data.get("reviews", {})
+        
+        if not reviews_data:
+            return {
+                "target_sentiment": None,
+                "competitor_sentiments": [],
+                "summary": "No reviews collected for sentiment analysis.",
+            }
+        
+        # Build context for LLM
+        reviews_context = []
+        for restaurant_name, data in reviews_data.items():
+            rating = data.get("rating", "N/A")
+            review_count = data.get("review_count", "N/A")
+            reviews = data.get("reviews", [])
+            
+            review_texts = "\n".join([
+                f"  - Rating: {r.get('rating', 'N/A')}/5 - \"{r.get('text', '')[:200]}...\""
+                for r in reviews[:5]
+            ])
+            
+            reviews_context.append(f"""
+### {restaurant_name}
+- **Overall Rating:** {rating}/5.0 (based on {review_count} reviews)
+- **Sample Reviews:**
+{review_texts}
+""")
+        
+        prompt = f"""Analyze the sentiment for these restaurants based on their ratings and reviews.
+
+{chr(10).join(reviews_context)}
+
+For each restaurant, provide:
+1. **Sentiment Score** (0.0 to 1.0, where 1.0 is most positive)
+2. **Key Strengths** (2-3 positive themes from reviews)
+3. **Key Concerns** (2-3 negative themes or areas for improvement)
+4. **Summary** (1-2 sentence assessment)
+
+Output as JSON:
+{{
+    "restaurants": [
+        {{
+            "name": "Restaurant Name",
+            "sentiment_score": 0.85,
+            "key_strengths": ["strength1", "strength2"],
+            "key_concerns": ["concern1", "concern2"],
+            "summary": "Brief assessment"
+        }}
+    ],
+    "comparative_summary": "How does the target compare to competitors?"
+}}"""
+
+        try:
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            result = self._extract_json(response.content)
+            
+            if result:
+                return {
+                    "restaurants": result.get("restaurants", []),
+                    "comparative_summary": result.get("comparative_summary", ""),
+                    "raw_reviews": reviews_data,
+                }
+        except Exception as e:
+            logger.error(f"[RESEARCHER] Error in LLM sentiment analysis: {e}")
+        
+        # Fallback: return raw data
+        return {
+            "restaurants": [],
+            "comparative_summary": "Sentiment analysis pending.",
+            "raw_reviews": reviews_data,
+        }
+
+    def _build_output(self, collected_data: dict, plan: dict[str, Any], sentiment_analysis: dict) -> dict[str, Any]:
         """Build research output dict from collected data."""
         target = plan.get("target_restaurant", "Unknown")
         location = plan.get("location", "Unknown")
         
-        # Process competitors - just keep as list of dicts
+        # Process competitors
         competitors = []
         for c in collected_data.get("competitors", []):
             if isinstance(c, dict):
@@ -233,18 +375,14 @@ Begin your research by first finding the target restaurant on Google Maps, then 
                     "address": c.get("address", ""),
                     "distance_miles": c.get("distance_miles", 0.0),
                     "rating": c.get("rating"),
-                    "review_count": c.get("review_count"),
+                    "review_count": c.get("review_count") or c.get("user_ratings_total"),
                     "price_level": c.get("price_level"),
                     "cuisine_type": c.get("cuisine_type", "restaurant"),
                     "website": c.get("website"),
                     "place_id": c.get("place_id"),
                 })
         
-        # Limit competitors
         competitors = competitors[:self.config.max_competitors]
-
-        # Build sentiment analysis
-        sentiment = self._analyze_sentiment(collected_data.get("reviews", []))
 
         # Build pricing analysis
         pricing = self._build_pricing_analysis(competitors)
@@ -256,68 +394,51 @@ Begin your research by first finding the target restaurant on Google Maps, then 
         menu_comparison = self._build_menu_comparison(collected_data.get("menus", []), target)
 
         return {
+            "target": collected_data.get("target"),
             "competitors": competitors,
             "menu_comparison": menu_comparison,
             "pricing_analysis": pricing,
-            "sentiment_analysis": sentiment,
+            "sentiment_analysis": sentiment_analysis,  # LLM-analyzed sentiment
             "market_signals": market_signals,
             "raw_sources": collected_data.get("sources", []),
             "research_notes": [
                 f"Analyzed {len(competitors)} competitors in {location}",
+                f"Collected reviews for {len(sentiment_analysis.get('raw_reviews', {}))} restaurants",
                 f"Research intent: {plan.get('intent', 'Unknown')}",
             ],
         }
 
-    def _analyze_sentiment(self, reviews: list) -> dict[str, Any]:
-        """Analyze sentiment from collected reviews."""
-        if not reviews:
-            return {
-                "target_overall_sentiment": None,
-                "positive_drivers": ["Insufficient review data"],
-                "common_complaints": ["No reviews collected"],
-                "sample_reviews": [],
-            }
+    def _extract_json(self, text: str) -> dict | None:
+        """Extract JSON from text."""
+        try:
+            return json.loads(text)
+        except:
+            pass
 
-        ratings = []
-        positive_themes = []
-        negative_themes = []
+        json_pattern = r"```(?:json)?\s*(\{[\s\S]*?\})\s*```"
+        match = re.search(json_pattern, text)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except:
+                pass
 
-        positive_keywords = ["great", "excellent", "delicious", "amazing", "best", "love", "fantastic", "friendly", "recommend", "fresh"]
-        negative_keywords = ["slow", "cold", "expensive", "rude", "wait", "disappointing", "mediocre", "overpriced", "dirty", "bad"]
+        brace_start = text.find("{")
+        brace_end = text.rfind("}") + 1
+        if brace_start != -1 and brace_end > brace_start:
+            try:
+                return json.loads(text[brace_start:brace_end])
+            except:
+                pass
 
-        for review in reviews:
-            if isinstance(review, dict):
-                rating = review.get("rating")
-                if rating:
-                    ratings.append(float(rating))
-
-                text = review.get("text", "").lower()
-                for kw in positive_keywords:
-                    if kw in text:
-                        positive_themes.append(kw)
-                for kw in negative_keywords:
-                    if kw in text:
-                        negative_themes.append(kw)
-
-        avg_rating = sum(ratings) / len(ratings) if ratings else None
-        overall = avg_rating / 5 if avg_rating else None
-
-        top_positive = [t[0] for t in Counter(positive_themes).most_common(5)]
-        top_negative = [t[0] for t in Counter(negative_themes).most_common(5)]
-
-        return {
-            "target_overall_sentiment": overall,
-            "positive_drivers": top_positive if top_positive else ["Good overall ratings"],
-            "common_complaints": top_negative if top_negative else ["No major complaints identified"],
-            "sample_reviews": reviews[:3],
-        }
+        return None
 
     def _build_pricing_analysis(self, competitors: list[dict]) -> dict[str, Any]:
         """Build pricing analysis from competitor data."""
         price_levels = []
         for c in competitors:
             if c.get("price_level"):
-                level = len(c["price_level"].replace(" ", ""))
+                level = len(str(c["price_level"]).replace(" ", ""))
                 price_levels.append(level)
 
         avg_level = sum(price_levels) / len(price_levels) if price_levels else 2
@@ -375,9 +496,9 @@ Begin your research by first finding the target restaurant on Google Maps, then 
             "competitor_density": competitor_count,
             "market_saturation": saturation,
             "avg_competitor_rating": avg_rating,
-            "foot_traffic_indicators": foot_traffic[:5] if foot_traffic else ["Foot traffic data not available"],
-            "growth_indicators": growth[:5] if growth else ["Growth signals not found"],
-            "risk_indicators": risks[:5] if risks else ["No significant risk signals"],
+            "foot_traffic_indicators": foot_traffic[:5] if foot_traffic else [],
+            "growth_indicators": growth[:5] if growth else [],
+            "risk_indicators": risks[:5] if risks else [],
         }
 
     def _build_menu_comparison(self, menus: list, target_name: str) -> dict[str, Any]:
@@ -412,10 +533,10 @@ Begin your research by first finding the target restaurant on Google Maps, then 
             raise ValueError("No planner_output found in state")
 
         try:
-            output = self.research(planner_output)  # planner_output is already a dict
+            output = self.research(planner_output)
             return {
                 **state,
-                "researcher_output": output,  # Plain dict
+                "researcher_output": output,
                 "current_node": "critic",
                 "iteration_count": state.get("iteration_count", 0) + 1,
             }
