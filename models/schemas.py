@@ -23,6 +23,25 @@ class SourceReference(BaseModel):
 
 
 # =============================================================================
+# COMPETITOR DATA (used in Google Maps integration)
+# =============================================================================
+
+
+class Competitor(BaseModel):
+    """Competitor restaurant data from Google Maps."""
+
+    name: str
+    address: str
+    distance_miles: float = 0.0
+    rating: float | None = None
+    review_count: int | None = None
+    price_level: str | None = None
+    cuisine_type: str = "restaurant"
+    website: str | None = None
+    place_id: str
+
+
+# =============================================================================
 # REPORT OUTPUT (Final output - MUST be validated for UI rendering)
 # =============================================================================
 
