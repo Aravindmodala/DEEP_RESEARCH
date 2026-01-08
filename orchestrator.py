@@ -1,18 +1,16 @@
 """
 LangGraph Orchestrator for the Deep Research Agent System.
 
-This module defines the multi-agent workflow using LangGraph's StateGraph.
+This module orchestrates the multi-agent workflow using LangGraph.
 The workflow follows: PLANNER → RESEARCHER → CRITIC → REPORT
 with conditional routing for REJECT cycles.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import datetime
-from typing import Any, TypedDict
+from typing import Any
 
-from langgraph.graph import END, StateGraph
 from loguru import logger
 
 from agents.critic import CriticAgent
@@ -20,36 +18,14 @@ from agents.planner import PlannerAgent
 from agents.report import ReportAgent
 from agents.researcher import ResearcherAgent
 from config import AgentConfig, get_config
+from graph import build_research_graph
 from models.schemas import (
     CriticOutput,
     PlannerOutput,
     ReportOutput,
     ResearcherOutput,
 )
-
-
-class AgentGraphState(TypedDict, total=False):
-    """State schema for the agent graph."""
-
-    # Input
-    user_query: str
-
-    # Node outputs (as dicts for serialization)
-    planner_output: dict[str, Any] | None
-    researcher_output: dict[str, Any] | None
-    critic_output: dict[str, Any] | None
-    report_output: dict[str, Any] | None
-
-    # Control flow
-    iteration_count: int
-    max_iterations: int
-    current_node: str
-    error_log: list[str]
-
-    # Metadata
-    session_id: str
-    started_at: str
-    completed_at: str | None
+from state import AgentGraphState
 
 
 class DeepResearchOrchestrator:
@@ -74,44 +50,16 @@ class DeepResearchOrchestrator:
         self.critic = CriticAgent(self.config)
         self.reporter = ReportAgent(self.config)
         
-        # Build the graph
-        self.graph = self._build_graph()
-        self.app = self.graph.compile()
-
-    def _build_graph(self) -> StateGraph:
-        """Build the LangGraph workflow."""
-        # Create state graph
-        workflow = StateGraph(AgentGraphState)
-
-        # Add nodes
-        workflow.add_node("planner", self._planner_node)
-        workflow.add_node("researcher", self._researcher_node)
-        workflow.add_node("critic", self._critic_node)
-        workflow.add_node("report", self._report_node)
-        workflow.add_node("error", self._error_node)
-
-        # Set entry point
-        workflow.set_entry_point("planner")
-
-        # Add edges
-        workflow.add_edge("planner", "researcher")
-        
-        # Conditional edge from critic
-        workflow.add_conditional_edges(
-            "critic",
-            self._route_critic_decision,
-            {
-                "researcher": "researcher",
-                "report": "report",
-                "error": "error",
-            },
+        # Build the graph using the graph builder
+        self.graph = build_research_graph(
+            planner_node=self._planner_node,
+            researcher_node=self._researcher_node,
+            critic_node=self._critic_node,
+            report_node=self._report_node,
+            error_node=self._error_node,
+            route_critic_decision=self._route_critic_decision,
         )
-
-        # Report goes to END
-        workflow.add_edge("report", END)
-        workflow.add_edge("error", END)
-
-        return workflow
+        self.app = self.graph.compile()
 
     def _planner_node(self, state: AgentGraphState) -> AgentGraphState:
         """Execute the Planner agent with human confirmation."""
@@ -504,4 +452,3 @@ def format_report_as_markdown(report: ReportOutput | dict) -> str:
     md.append("")
 
     return "\n".join(md)
-
