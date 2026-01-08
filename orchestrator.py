@@ -4,6 +4,11 @@ LangGraph Orchestrator for the Deep Research Agent System.
 This module orchestrates the multi-agent workflow using LangGraph.
 The workflow follows: PLANNER → RESEARCHER → CRITIC → REPORT
 with conditional routing for REJECT cycles.
+
+Features:
+- State caching for efficient retry loops
+- Progress tracking for resumable research
+- Iteration limits with graceful fallback
 """
 
 from __future__ import annotations
@@ -25,7 +30,14 @@ from models.schemas import (
     ReportOutput,
     ResearcherOutput,
 )
-from state import AgentGraphState
+from state import (
+    AgentGraphState,
+    ResearchCache,
+    ResearchProgress,
+    create_initial_state,
+    get_cache,
+    get_progress,
+)
 
 
 class DeepResearchOrchestrator:
@@ -33,8 +45,8 @@ class DeepResearchOrchestrator:
     Orchestrates the multi-agent research workflow.
     
     Flow:
-    1. PLANNER: Parse user query → research plan
-    2. RESEARCHER: Execute research with ReAct loop
+    1. PLANNER: Parse user query → research plan (with human confirmation)
+    2. RESEARCHER: Execute research with ReAct loop (with caching)
     3. CRITIC: Evaluate quality
        - If ACCEPT → REPORT
        - If REJECT → back to RESEARCHER (up to max_iterations)
@@ -50,7 +62,7 @@ class DeepResearchOrchestrator:
         self.critic = CriticAgent(self.config)
         self.reporter = ReportAgent(self.config)
         
-        # Build the graph using the graph builder
+        # Build the graph
         self.graph = build_research_graph(
             planner_node=self._planner_node,
             researcher_node=self._researcher_node,
@@ -76,7 +88,6 @@ class DeepResearchOrchestrator:
             }
 
         try:
-            # Use plan_with_confirmation for human-in-the-loop
             output = self.planner.plan_with_confirmation(user_query)
             return {
                 **state,
@@ -99,9 +110,10 @@ class DeepResearchOrchestrator:
             }
 
     def _researcher_node(self, state: AgentGraphState) -> AgentGraphState:
-        """Execute the Researcher agent."""
+        """Execute the Researcher agent with caching support."""
+        iteration = state.get("iteration_count", 0) + 1
         logger.info("=" * 60)
-        logger.info(f"NODE: RESEARCHER (Iteration {state.get('iteration_count', 0) + 1})")
+        logger.info(f"NODE: RESEARCHER (Iteration {iteration})")
         logger.info("=" * 60)
 
         planner_output = state.get("planner_output")
@@ -110,32 +122,43 @@ class DeepResearchOrchestrator:
                 **state,
                 "error_log": state.get("error_log", []) + ["No planner output"],
                 "current_node": "error",
+                "iteration_count": iteration,
             }
 
         try:
             plan = PlannerOutput(**planner_output)
             
-            # If this is a retry, include critic feedback
+            # Get cache and progress from state
+            cache = get_cache(state)
+            progress = get_progress(state)
+            
+            # Log critic feedback if this is a retry
             critic_output = state.get("critic_output")
             if critic_output and isinstance(critic_output, dict):
                 feedback = critic_output.get("required_fixes", [])
                 if feedback:
-                    logger.info(f"[RESEARCHER] Addressing critic feedback: {feedback}")
+                    logger.info(f"[RESEARCHER] Addressing critic feedback: {feedback[:2]}")
             
-            output = self.researcher.research(plan)
+            # Execute research with caching
+            output, updated_cache, updated_progress = self.researcher.research(
+                plan, cache, progress
+            )
             
             return {
                 **state,
                 "researcher_output": output.model_dump(),
-                "iteration_count": state.get("iteration_count", 0) + 1,
+                "research_cache": updated_cache,
+                "research_progress": updated_progress,
+                "iteration_count": iteration,
                 "current_node": "critic",
             }
         except Exception as e:
             logger.error(f"Researcher error: {e}")
             return {
                 **state,
-                "error_log": state.get("error_log", []) + [f"Researcher error: {str(e)}"],
+                "error_log": state.get("error_log", []) + [f"Researcher: {str(e)[:200]}"],
                 "current_node": "error",
+                "iteration_count": iteration,  # Always increment
             }
 
     def _critic_node(self, state: AgentGraphState) -> AgentGraphState:
@@ -156,6 +179,9 @@ class DeepResearchOrchestrator:
             research = ResearcherOutput(**researcher_output)
             output = self.critic.evaluate(research)
             
+            logger.info(f"[CRITIC] Decision: {output.decision}")
+            logger.info(f"[CRITIC] Quality Score: {output.quality_score}/10")
+            
             return {
                 **state,
                 "critic_output": output.model_dump(),
@@ -165,7 +191,7 @@ class DeepResearchOrchestrator:
             logger.error(f"Critic error: {e}")
             return {
                 **state,
-                "error_log": state.get("error_log", []) + [f"Critic error: {str(e)}"],
+                "error_log": state.get("error_log", []) + [f"Critic: {str(e)[:200]}"],
                 "current_node": "error",
             }
 
@@ -182,6 +208,8 @@ class DeepResearchOrchestrator:
 
             report = self.reporter.generate(plan, research, critique)
             
+            logger.info(f"[REPORT] Generated: {report.report_title}")
+            
             return {
                 **state,
                 "report_output": report.model_dump(),
@@ -192,7 +220,7 @@ class DeepResearchOrchestrator:
             logger.error(f"Report error: {e}")
             return {
                 **state,
-                "error_log": state.get("error_log", []) + [f"Report error: {str(e)}"],
+                "error_log": state.get("error_log", []) + [f"Report: {str(e)[:200]}"],
                 "current_node": "error",
             }
 
@@ -200,7 +228,9 @@ class DeepResearchOrchestrator:
         """Handle errors in the workflow."""
         logger.error("=" * 60)
         logger.error("NODE: ERROR")
-        logger.error(f"Errors: {state.get('error_log', [])}")
+        errors = state.get("error_log", [])
+        for err in errors[-3:]:  # Show last 3 errors
+            logger.error(f"  - {err}")
         logger.error("=" * 60)
         return {
             **state,
@@ -216,13 +246,18 @@ class DeepResearchOrchestrator:
         max_iter = state.get("max_iterations", self.config.max_research_iterations)
 
         if decision == "ACCEPT":
-            logger.info("[ROUTER] Critic ACCEPTED - routing to REPORT")
+            logger.info("[ROUTER] Critic ACCEPTED → REPORT")
             return "report"
         elif iteration >= max_iter:
-            logger.warning(f"[ROUTER] Max iterations ({max_iter}) reached - forcing to REPORT")
+            logger.warning(f"[ROUTER] Max iterations ({max_iter}) reached → forcing REPORT")
             return "report"
         else:
-            logger.info(f"[ROUTER] Critic REJECTED - routing back to RESEARCHER (iteration {iteration + 1})")
+            # Log what we're preserving
+            cache = get_cache(state)
+            competitors_cached = len(cache.get("competitors", []))
+            menus_cached = len(cache.get("menus", {}))
+            logger.info(f"[ROUTER] Critic REJECTED → RESEARCHER (iteration {iteration + 1})")
+            logger.info(f"[ROUTER] Cache: {competitors_cached} competitors, {menus_cached} menus preserved")
             return "researcher"
 
     def run(
@@ -245,29 +280,28 @@ class DeepResearchOrchestrator:
         logger.info(f"Query: {user_query}")
         logger.info("=" * 80)
 
-        # Initialize state
-        initial_state: AgentGraphState = {
-            "user_query": user_query,
-            "planner_output": None,
-            "researcher_output": None,
-            "critic_output": None,
-            "report_output": None,
-            "iteration_count": 0,
-            "max_iterations": self.config.max_research_iterations,
-            "current_node": "planner",
-            "error_log": [],
-            "session_id": session_id or datetime.now().strftime("%Y%m%d_%H%M%S"),
-            "started_at": datetime.now().isoformat(),
-            "completed_at": None,
-        }
+        # Use the helper function to create properly initialized state
+        session = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        initial_state = create_initial_state(
+            user_query=user_query,
+            session_id=session,
+            max_iterations=self.config.max_research_iterations,
+        )
 
         # Run the graph
         final_state = self.app.invoke(initial_state)
 
+        # Log summary
         logger.info("=" * 80)
         logger.info("DEEP RESEARCH AGENT - COMPLETE")
         logger.info(f"Final node: {final_state.get('current_node')}")
         logger.info(f"Iterations: {final_state.get('iteration_count')}")
+        
+        # Log cache stats
+        cache = get_cache(final_state)
+        logger.info(f"Cache stats: {len(cache.get('competitors', []))} competitors, "
+                   f"{len(cache.get('menus', {}))} menus, "
+                   f"{len(cache.get('reviews', {}))} review sets")
         logger.info("=" * 80)
 
         return final_state
@@ -282,20 +316,12 @@ class DeepResearchOrchestrator:
         
         Yields state updates after each node execution.
         """
-        initial_state: AgentGraphState = {
-            "user_query": user_query,
-            "planner_output": None,
-            "researcher_output": None,
-            "critic_output": None,
-            "report_output": None,
-            "iteration_count": 0,
-            "max_iterations": self.config.max_research_iterations,
-            "current_node": "planner",
-            "error_log": [],
-            "session_id": session_id or datetime.now().strftime("%Y%m%d_%H%M%S"),
-            "started_at": datetime.now().isoformat(),
-            "completed_at": None,
-        }
+        session = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+        initial_state = create_initial_state(
+            user_query=user_query,
+            session_id=session,
+            max_iterations=self.config.max_research_iterations,
+        )
 
         for event in self.app.stream(initial_state):
             yield event

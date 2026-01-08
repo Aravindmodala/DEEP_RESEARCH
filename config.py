@@ -79,7 +79,7 @@ class AgentConfig(BaseSettings):
     # Research Settings
     # =========================================================================
     max_research_iterations: int = Field(
-        default=3,
+        default=2,
         description="Maximum research loop iterations before forcing accept",
     )
     competitor_search_radius_miles: float = Field(

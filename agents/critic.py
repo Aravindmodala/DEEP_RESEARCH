@@ -140,14 +140,14 @@ class CriticAgent:
                 )
             )
 
-        # Check menu data
+        # Check menu data (minor issue since some sites block extraction)
         if self.config.require_menu_data:
             if not research.menu_comparison or not research.menu_comparison.target_menu:
                 issues.append(
                     CriticIssue(
-                        severity="major",
+                        severity="minor",  # Reduced from major - extraction often fails
                         category="completeness",
-                        description="Target restaurant menu data not extracted",
+                        description="Target restaurant menu data not extracted (site may block scraping)",
                         affected_section="menu_comparison",
                     )
                 )

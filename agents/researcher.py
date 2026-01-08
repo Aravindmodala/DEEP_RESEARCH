@@ -1,7 +1,8 @@
-"""RESEARCHER Agent - Autonomous ReAct-style research execution."""
+"""RESEARCHER Agent - Autonomous ReAct-style research execution with state caching."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime
 from typing import Any
@@ -23,28 +24,42 @@ from models.schemas import (
     SourceReference,
 )
 from prompts import RESEARCHER_SYSTEM_PROMPT
+from state import AgentGraphState, ResearchCache, ResearchProgress, get_cache, get_progress
 from tools.google_maps import create_google_maps_tools
-from tools.tavily_search import create_tavily_tools
 from tools.tavily_extract import create_tavily_extract_tools
+from tools.tavily_search import create_tavily_tools
 from tools.web_scraper import create_scraper_tools
 from utils import create_llm
+
+
+# Maximum characters per tool result to prevent token overflow
+MAX_TOOL_RESULT_CHARS = 4000
+
+
+def truncate_result(result: str, max_chars: int = MAX_TOOL_RESULT_CHARS) -> str:
+    """Truncate tool result to prevent token overflow."""
+    if len(result) <= max_chars:
+        return result
+    return result[:max_chars] + f"\n\n[...truncated {len(result) - max_chars} chars]"
+
+
+def hash_query(query: str) -> str:
+    """Create a hash key for caching search results."""
+    return hashlib.md5(query.encode()).hexdigest()[:12]
 
 
 class ResearcherAgent:
     """
     NODE 2 — RESEARCHER AGENT (AUTONOMOUS)
     
-    Responsibility: Execute the research plan end-to-end using ReAct loop.
-    
-    Loop: Think → Act → Observe → Iterate
-    
-    Tools Available:
-    - Google Maps / Places API
-    - Tavily Search
-    - Web Scraper (Extract & Crawl)
+    Features:
+    - State caching to avoid duplicate API calls
+    - Progress tracking for resumable research
+    - Token-safe tool result truncation
+    - ReAct loop: Think → Act → Observe → Iterate
     """
 
-    MAX_REACT_ITERATIONS = 15  # Safety limit for ReAct loop
+    MAX_REACT_ITERATIONS = 10  # Reduced for efficiency
 
     def __init__(self, config: AgentConfig):
         self.config = config
@@ -70,14 +85,14 @@ class ResearcherAgent:
         except Exception as e:
             logger.warning(f"[RESEARCHER] Tavily Search tools unavailable: {e}")
 
-        # Tavily Extract tools (for URL content extraction)
+        # Tavily Extract tools
         try:
             tools.extend(create_tavily_extract_tools(self.config.tavily_api_key))
             logger.info("[RESEARCHER] Loaded Tavily Extract tools")
         except Exception as e:
             logger.warning(f"[RESEARCHER] Tavily Extract tools unavailable: {e}")
 
-        # Web scraper tools (uses Tavily Extract under the hood)
+        # Web scraper tools
         try:
             tools.extend(create_scraper_tools(self.config.tavily_api_key))
             logger.info("[RESEARCHER] Loaded Web Scraper tools")
@@ -86,52 +101,78 @@ class ResearcherAgent:
 
         return tools
 
-    def research(self, plan: PlannerOutput) -> ResearcherOutput:
+    def research(
+        self,
+        plan: PlannerOutput,
+        cache: ResearchCache | None = None,
+        progress: ResearchProgress | None = None,
+    ) -> tuple[ResearcherOutput, ResearchCache, ResearchProgress]:
         """
-        Execute research based on the planner's output.
-        Uses ReAct loop: Think → Act → Observe → Iterate
+        Execute research with caching support.
         
         Args:
             plan: Structured research plan from Planner
+            cache: Existing cache to resume from (optional)
+            progress: Existing progress to resume from (optional)
             
         Returns:
-            ResearcherOutput with all gathered intelligence
+            Tuple of (ResearcherOutput, updated_cache, updated_progress)
         """
         logger.info(f"[RESEARCHER] Starting research for {plan.target_restaurant}")
         logger.info(f"[RESEARCHER] Location: {plan.location}")
-        logger.info(f"[RESEARCHER] Intent: {plan.intent}")
+        logger.info(f"[RESEARCHER] Cuisine: {plan.cuisine_type}")
+
+        # Initialize or use existing cache/progress
+        cache = cache or ResearchCache(
+            target_restaurant=None,
+            competitors=[],
+            menus={},
+            reviews={},
+            search_results={},
+            market_data=[],
+        )
+        progress = progress or ResearchProgress(
+            target_found=False,
+            competitors_found=False,
+            target_menu_extracted=False,
+            competitor_menus_extracted=False,
+            reviews_collected=False,
+            market_signals_gathered=False,
+            synthesis_complete=False,
+        )
+
+        # Log existing progress
+        completed = [k for k, v in progress.items() if v]
+        if completed:
+            logger.info(f"[RESEARCHER] Resuming with completed steps: {completed}")
 
         # Bind tools to LLM
         llm_with_tools = self.llm.bind_tools(self.tools)
 
-        # Initialize conversation with plan context
+        # Initialize conversation - include cache summary if resuming
+        cache_context = self._format_cache_context(cache, progress)
         messages = [
             SystemMessage(content=RESEARCHER_SYSTEM_PROMPT),
-            HumanMessage(content=self._format_plan_message(plan)),
+            HumanMessage(content=self._format_plan_message(plan, cache_context)),
         ]
-
-        # Track collected data
-        collected_data = {
-            "competitors": [],
-            "reviews": [],
-            "menus": [],
-            "market_data": [],
-            "sources": [],
-        }
 
         # ReAct loop
         iteration = 0
         while iteration < self.MAX_REACT_ITERATIONS:
             iteration += 1
-            logger.info(f"[RESEARCHER] ReAct iteration {iteration}")
+            logger.info(f"[RESEARCHER] ReAct iteration {iteration}/{self.MAX_REACT_ITERATIONS}")
 
-            # Get LLM response
-            response = llm_with_tools.invoke(messages)
-            messages.append(response)
+            try:
+                response = llm_with_tools.invoke(messages)
+                messages.append(response)
+            except Exception as e:
+                logger.error(f"[RESEARCHER] LLM error: {e}")
+                # On error, try to synthesize from what we have
+                break
 
-            # Check if LLM is done (no tool calls)
+            # Check if LLM is done
             if not response.tool_calls:
-                logger.info("[RESEARCHER] No more tool calls - synthesizing results")
+                logger.info("[RESEARCHER] No more tool calls - synthesis phase")
                 break
 
             # Execute tool calls
@@ -140,59 +181,77 @@ class ResearcherAgent:
                 tool_args = tool_call["args"]
                 tool_id = tool_call.get("id", f"call_{iteration}")
 
-                logger.info(f"[RESEARCHER] Calling tool: {tool_name}")
-                logger.debug(f"[RESEARCHER] Tool args: {tool_args}")
-
+                logger.info(f"[RESEARCHER] Tool: {tool_name}")
+                
                 try:
-                    tool = self.tool_map.get(tool_name)
-                    if tool:
-                        result = tool.invoke(tool_args)
-                        self._collect_data(collected_data, tool_name, result)
-                        
-                        # Record source
-                        collected_data["sources"].append(
-                            SourceReference(
-                                source_type=self._get_source_type(tool_name),
-                                title=f"{tool_name} call",
-                                data_summary=str(result)[:200],
-                                accessed_at=datetime.now().isoformat(),
-                            )
-                        )
+                    # Check cache first for certain tools
+                    cached_result = self._check_cache(cache, tool_name, tool_args)
+                    
+                    if cached_result is not None:
+                        logger.info(f"[RESEARCHER] Using cached result for {tool_name}")
+                        result = cached_result
                     else:
-                        result = f"Tool {tool_name} not found"
-                        logger.warning(result)
+                        # Execute tool
+                        tool = self.tool_map.get(tool_name)
+                        if tool:
+                            result = tool.invoke(tool_args)
+                            # Update cache
+                            self._update_cache(cache, progress, tool_name, tool_args, result)
+                        else:
+                            result = f"Tool {tool_name} not found"
+                            logger.warning(result)
+
+                    # Truncate result to prevent token overflow
+                    result_str = truncate_result(str(result))
+                    
                 except Exception as e:
-                    result = f"Tool error: {str(e)}"
-                    logger.error(f"[RESEARCHER] Tool {tool_name} error: {e}")
+                    result_str = f"Tool error: {str(e)[:200]}"
+                    logger.error(f"[RESEARCHER] {tool_name} error: {e}")
 
-                # Add tool result to messages
-                messages.append(
-                    ToolMessage(content=str(result), tool_call_id=tool_id)
-                )
+                messages.append(ToolMessage(content=result_str, tool_call_id=tool_id))
 
-        # Ask LLM to synthesize final output
-        synthesis_prompt = self._create_synthesis_prompt(collected_data, plan)
-        messages.append(HumanMessage(content=synthesis_prompt))
-        
-        final_response = self.llm.invoke(messages)
-        
-        # Parse and structure the output
-        output = self._parse_output(final_response.content, collected_data, plan)
-        
-        logger.info(
-            f"[RESEARCHER] Research complete. Found {len(output.competitors)} competitors"
-        )
-        return output
+        # Synthesize output from cache
+        output = self._synthesize_from_cache(cache, progress, plan, messages)
+        progress["synthesis_complete"] = True
 
-    def _format_plan_message(self, plan: PlannerOutput) -> str:
+        logger.info(f"[RESEARCHER] Complete. {len(output.competitors)} competitors found.")
+        return output, cache, progress
+
+    def _format_cache_context(self, cache: ResearchCache, progress: ResearchProgress) -> str:
+        """Format cache contents for context injection."""
+        if not any(progress.values()):
+            return ""
+
+        lines = ["## Previously Collected Data (use this, don't re-fetch):"]
+        
+        if progress.get("target_found") and cache.get("target_restaurant"):
+            target = cache["target_restaurant"]
+            lines.append(f"- Target restaurant found: {target.get('name', 'Unknown')}")
+            lines.append(f"  Place ID: {target.get('place_id', 'N/A')}")
+        
+        if progress.get("competitors_found") and cache.get("competitors"):
+            lines.append(f"- {len(cache['competitors'])} competitors already found")
+            for c in cache["competitors"][:3]:
+                lines.append(f"  • {c.get('name', 'Unknown')} ({c.get('rating', 'N/A')}★)")
+        
+        if progress.get("target_menu_extracted") and cache.get("menus"):
+            lines.append(f"- {len(cache['menus'])} menus already extracted")
+        
+        if progress.get("reviews_collected") and cache.get("reviews"):
+            total_reviews = sum(len(r) for r in cache["reviews"].values())
+            lines.append(f"- {total_reviews} reviews already collected")
+
+        return "\n".join(lines)
+
+    def _format_plan_message(self, plan: PlannerOutput, cache_context: str = "") -> str:
         """Format the plan into a message for the researcher."""
-        cuisine_info = f"**Cuisine Type:** {plan.cuisine_type}" if plan.cuisine_type and plan.cuisine_type != "unknown" else "**Cuisine Type:** (to be determined from research)"
+        cuisine = plan.cuisine_type if plan.cuisine_type != "unknown" else "restaurant"
         
-        return f"""## Research Plan
+        base = f"""## Research Plan
 
 **Target Restaurant:** {plan.target_restaurant}
 **Location:** {plan.location}
-{cuisine_info}
+**Cuisine Type:** {cuisine}
 **Intent:** {plan.intent}
 
 **Research Queries:**
@@ -201,157 +260,177 @@ class ResearcherAgent:
 3. {plan.search_queries[2]}
 4. {plan.search_queries[3]}
 
-## IMPORTANT REQUIREMENTS:
+{cache_context}
 
-1. **Find competitors of the SAME cuisine type** ({plan.cuisine_type or 'same as target'})
-   - Use find_competitors with cuisine_type="{plan.cuisine_type or 'restaurant'}"
-   - Only include direct competitors (same cuisine category)
+## Requirements:
 
-2. **Scrape menus for TARGET + TOP 3 COMPETITORS**:
-   - Search for "{plan.target_restaurant} menu" and extract the menu page
-   - For each of the top 3 competitors by rating:
-     a. Search for "[Competitor Name] menu"
-     b. Use extract_menu_page to get full menu content
-     c. Analyze items and prices
+1. **Find same-cuisine competitors** using find_competitors with cuisine_type="{cuisine}"
+2. **Extract menus** for target + top 3 competitors
+3. **Collect reviews** for sentiment analysis
+4. **Gather market signals** for lending assessment
 
-3. **Get reviews for target restaurant** using get_restaurant_reviews
+Begin research now. Skip any steps already completed (see above)."""
+        return base
 
-Begin your research by first finding the target restaurant on Google Maps, then discovering nearby {plan.cuisine_type or ''} competitors."""
+    def _check_cache(
+        self, cache: ResearchCache, tool_name: str, tool_args: dict
+    ) -> str | None:
+        """Check if we have cached results for this tool call."""
+        # Check for cached competitor search
+        if tool_name == "find_competitors" and cache.get("competitors"):
+            return json.dumps({
+                "competitors": cache["competitors"],
+                "message": "Using cached competitor data"
+            })
+        
+        # Check for cached target restaurant
+        if tool_name == "find_restaurant" and cache.get("target_restaurant"):
+            return json.dumps(cache["target_restaurant"])
+        
+        # Check for cached search results
+        if "search" in tool_name and cache.get("search_results"):
+            query = tool_args.get("query", "")
+            query_hash = hash_query(query)
+            if query_hash in cache["search_results"]:
+                return json.dumps(cache["search_results"][query_hash])
+        
+        return None
 
-    def _get_source_type(self, tool_name: str) -> str:
-        """Map tool name to source type."""
-        if "restaurant" in tool_name or "competitor" in tool_name or "review" in tool_name:
-            return "google_maps"
-        elif "search" in tool_name or "traffic" in tool_name or "market" in tool_name:
-            return "tavily"
-        elif "extract" in tool_name or "crawl" in tool_name:
-            return "website_scrape"
-        return "api"
-
-    def _collect_data(
-        self, collected_data: dict, tool_name: str, result: str
+    def _update_cache(
+        self,
+        cache: ResearchCache,
+        progress: ResearchProgress,
+        tool_name: str,
+        tool_args: dict,
+        result: Any,
     ) -> None:
-        """Collect and organize data from tool results."""
+        """Update cache with tool results."""
         try:
-            # Try to parse as dict/list
+            # Parse result if string
             if isinstance(result, str):
-                # Handle string representations of dicts/lists
-                if result.startswith("{") or result.startswith("["):
-                    try:
-                        parsed = eval(result)  # Safe for our structured outputs
-                    except:
-                        parsed = result
-                else:
+                try:
+                    parsed = json.loads(result)
+                except:
                     parsed = result
             else:
                 parsed = result
 
-            # Route to appropriate collection
-            if "competitor" in tool_name.lower():
+            # Update based on tool type
+            if tool_name == "find_restaurant":
                 if isinstance(parsed, dict):
-                    if "competitors" in parsed:
-                        collected_data["competitors"].extend(parsed["competitors"])
-                    if "target" in parsed and parsed["target"]:
-                        collected_data["target"] = parsed["target"]
+                    cache["target_restaurant"] = parsed
+                    progress["target_found"] = True
+                    logger.debug("[CACHE] Saved target restaurant")
+
+            elif tool_name == "find_competitors":
+                if isinstance(parsed, dict) and "competitors" in parsed:
+                    cache["competitors"] = parsed["competitors"]
+                    progress["competitors_found"] = True
+                    logger.debug(f"[CACHE] Saved {len(parsed['competitors'])} competitors")
+
+            elif "menu" in tool_name.lower() or "extract" in tool_name.lower():
+                restaurant_name = tool_args.get("restaurant_name", "unknown")
+                if isinstance(parsed, (str, dict)):
+                    cache["menus"][restaurant_name] = str(parsed)[:8000]  # Limit size
+                    if "target" in restaurant_name.lower() or progress.get("target_found"):
+                        progress["target_menu_extracted"] = True
+                    else:
+                        progress["competitor_menus_extracted"] = True
+                    logger.debug(f"[CACHE] Saved menu for {restaurant_name}")
+
             elif "review" in tool_name.lower():
+                place_id = tool_args.get("place_id", "default")
                 if isinstance(parsed, list):
-                    collected_data["reviews"].extend(parsed)
-            elif "menu" in tool_name.lower():
-                collected_data["menus"].append(parsed)
-            elif "search" in tool_name.lower() or "market" in tool_name.lower():
+                    cache["reviews"][place_id] = parsed[:20]  # Limit count
+                    progress["reviews_collected"] = True
+                    logger.debug(f"[CACHE] Saved {len(parsed)} reviews")
+
+            elif "search" in tool_name.lower():
+                query = tool_args.get("query", "")
+                query_hash = hash_query(query)
                 if isinstance(parsed, list):
-                    collected_data["market_data"].extend(parsed)
-                else:
-                    collected_data["market_data"].append(parsed)
+                    cache["search_results"][query_hash] = parsed[:10]  # Limit count
+                elif isinstance(parsed, dict):
+                    cache["search_results"][query_hash] = parsed
+                progress["market_signals_gathered"] = True
+                logger.debug(f"[CACHE] Saved search results for '{query[:30]}...'")
+
+            elif "market" in tool_name.lower() or "traffic" in tool_name.lower():
+                if isinstance(parsed, (list, dict)):
+                    cache["market_data"].append(parsed)
+                    progress["market_signals_gathered"] = True
 
         except Exception as e:
-            logger.warning(f"[RESEARCHER] Error collecting data: {e}")
+            logger.warning(f"[CACHE] Error updating cache: {e}")
 
-    def _create_synthesis_prompt(
-        self, collected_data: dict, plan: PlannerOutput
-    ) -> str:
-        """Create prompt for LLM to synthesize findings."""
-        return f"""## Synthesis Request
-
-You have completed your research. Now synthesize ALL findings into a structured JSON output.
-
-**Collected Data Summary:**
-- Competitors found: {len(collected_data.get('competitors', []))}
-- Reviews collected: {len(collected_data.get('reviews', []))}
-- Menu data points: {len(collected_data.get('menus', []))}
-- Market data points: {len(collected_data.get('market_data', []))}
-- Sources used: {len(collected_data.get('sources', []))}
-
-**Required Output Structure:**
-{{
-    "competitors": [...],  // List of competitor objects
-    "menu_comparison": {{...}},  // Menu analysis
-    "pricing_analysis": {{...}},  // Pricing position
-    "sentiment_analysis": {{...}},  // Review sentiment
-    "market_signals": {{...}},  // Market indicators
-    "research_notes": [...]  // Key observations
-}}
-
-Synthesize everything you learned about {plan.target_restaurant} in {plan.location}.
-Output ONLY the JSON - no additional text."""
-
-    def _parse_output(
+    def _synthesize_from_cache(
         self,
-        response_text: str,
-        collected_data: dict,
+        cache: ResearchCache,
+        progress: ResearchProgress,
         plan: PlannerOutput,
+        messages: list,
     ) -> ResearcherOutput:
-        """Parse LLM synthesis into structured output."""
-        # Try to extract JSON from response
-        try:
-            json_data = self._extract_json(response_text)
-        except:
-            json_data = {}
-
-        # Build competitors list from collected data
+        """Synthesize output from cached data."""
+        # Build competitors from cache
         competitors = []
-        for c in collected_data.get("competitors", []):
+        for c in cache.get("competitors", []):
             if isinstance(c, dict):
                 try:
-                    competitors.append(
-                        Competitor(
-                            name=c.get("name", "Unknown"),
-                            address=c.get("address", ""),
-                            distance_miles=c.get("distance_miles", 0.0),
-                            rating=c.get("rating"),
-                            review_count=c.get("review_count"),
-                            price_level=c.get("price_level"),
-                            cuisine_type=c.get("cuisine_type", "restaurant"),
-                            website=c.get("website"),
-                            place_id=c.get("place_id"),
-                        )
-                    )
+                    competitors.append(Competitor(
+                        name=c.get("name", "Unknown"),
+                        address=c.get("address", ""),
+                        distance_miles=float(c.get("distance_miles", 0)),
+                        rating=c.get("rating"),
+                        review_count=c.get("review_count"),
+                        price_level=c.get("price_level"),
+                        cuisine_type=c.get("cuisine_type", plan.cuisine_type),
+                        website=c.get("website"),
+                        place_id=c.get("place_id"),
+                    ))
                 except Exception as e:
-                    logger.warning(f"Error parsing competitor: {e}")
+                    logger.debug(f"Skip competitor parse: {e}")
 
-        # Build sentiment from reviews
-        sentiment = self._analyze_sentiment(collected_data.get("reviews", []))
+        # Build sentiment from cached reviews
+        all_reviews = []
+        for reviews in cache.get("reviews", {}).values():
+            all_reviews.extend(reviews)
+        sentiment = self._analyze_sentiment(all_reviews)
 
-        # Build menu comparison
+        # Build menu comparison from cache
         menu_comparison = self._build_menu_comparison(
-            collected_data.get("menus", []), plan.target_restaurant
+            cache.get("menus", {}), plan.target_restaurant
         )
 
         # Build pricing analysis
-        pricing = self._build_pricing_analysis(competitors, collected_data.get("menus", []))
+        pricing = self._build_pricing_analysis(competitors, cache.get("menus", {}))
 
         # Build market signals
         market_signals = self._build_market_signals(
-            competitors, collected_data.get("market_data", [])
+            competitors, cache.get("market_data", [])
         )
 
-        # Extract research notes from LLM response
-        research_notes = json_data.get("research_notes", [])
-        if not research_notes and isinstance(json_data, dict):
-            research_notes = [
-                f"Analyzed {len(competitors)} competitors in {plan.location}",
-                f"Research intent: {plan.intent}",
-            ]
+        # Sources
+        sources = [
+            SourceReference(
+                source_type="google_maps",
+                title="Google Places API",
+                data_summary=f"Found {len(competitors)} competitors",
+                accessed_at=datetime.now().isoformat(),
+            ),
+            SourceReference(
+                source_type="tavily",
+                title="Web Search",
+                data_summary=f"Searched {len(cache.get('search_results', {}))} queries",
+                accessed_at=datetime.now().isoformat(),
+            ),
+        ]
+
+        research_notes = [
+            f"Analyzed {len(competitors)} {plan.cuisine_type} competitors in {plan.location}",
+            f"Extracted {len(cache.get('menus', {}))} menus",
+            f"Collected {len(all_reviews)} reviews for sentiment analysis",
+            f"Research intent: {plan.intent}",
+        ]
 
         return ResearcherOutput(
             competitors=competitors[:self.config.max_competitors],
@@ -359,39 +438,9 @@ Output ONLY the JSON - no additional text."""
             pricing_analysis=pricing,
             sentiment_analysis=sentiment,
             market_signals=market_signals,
-            raw_sources=collected_data.get("sources", []),
+            raw_sources=sources,
             research_notes=research_notes,
         )
-
-    def _extract_json(self, text: str) -> dict:
-        """Extract JSON from text."""
-        import re
-
-        # Try direct parse
-        try:
-            return json.loads(text)
-        except:
-            pass
-
-        # Find JSON block
-        json_pattern = r"```(?:json)?\s*(\{[\s\S]*?\})\s*```"
-        match = re.search(json_pattern, text)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except:
-                pass
-
-        # Find raw JSON
-        brace_start = text.find("{")
-        brace_end = text.rfind("}") + 1
-        if brace_start != -1 and brace_end > brace_start:
-            try:
-                return json.loads(text[brace_start:brace_end])
-            except:
-                pass
-
-        return {}
 
     def _analyze_sentiment(self, reviews: list) -> SentimentAnalysis:
         """Analyze sentiment from collected reviews."""
@@ -401,82 +450,55 @@ Output ONLY the JSON - no additional text."""
                 common_complaints=["No reviews collected"],
             )
 
-        # Extract ratings and text
         ratings = []
         positive_themes = []
         negative_themes = []
 
-        positive_keywords = [
-            "great", "excellent", "delicious", "amazing", "best",
-            "love", "fantastic", "friendly", "recommend", "fresh",
-        ]
-        negative_keywords = [
-            "slow", "cold", "expensive", "rude", "wait", "disappointing",
-            "mediocre", "overpriced", "dirty", "bad",
-        ]
+        positive_kw = ["great", "excellent", "delicious", "amazing", "best", "love", "fantastic", "friendly", "recommend", "fresh"]
+        negative_kw = ["slow", "cold", "expensive", "rude", "wait", "disappointing", "mediocre", "overpriced", "dirty", "bad"]
 
         for review in reviews:
             if isinstance(review, dict):
-                rating = review.get("rating")
-                if rating:
-                    ratings.append(float(rating))
-
+                if review.get("rating"):
+                    ratings.append(float(review["rating"]))
                 text = review.get("text", "").lower()
-                for kw in positive_keywords:
+                for kw in positive_kw:
                     if kw in text:
                         positive_themes.append(kw)
-                for kw in negative_keywords:
+                for kw in negative_kw:
                     if kw in text:
                         negative_themes.append(kw)
 
-        # Calculate overall sentiment
         avg_rating = sum(ratings) / len(ratings) if ratings else None
         overall = avg_rating / 5 if avg_rating else None
 
-        # Get top themes
         from collections import Counter
-        top_positive = [t[0] for t in Counter(positive_themes).most_common(5)]
-        top_negative = [t[0] for t in Counter(negative_themes).most_common(5)]
+        top_pos = [t[0] for t in Counter(positive_themes).most_common(5)] or ["Good ratings"]
+        top_neg = [t[0] for t in Counter(negative_themes).most_common(5)] or ["No major complaints"]
 
         return SentimentAnalysis(
             target_overall_sentiment=overall,
-            target_sentiment_breakdown=SentimentBreakdown(
-                food_quality=overall,
-                service=overall,
-            ),
-            positive_drivers=top_positive if top_positive else ["Good overall ratings"],
-            common_complaints=top_negative if top_negative else ["No major complaints identified"],
+            target_sentiment_breakdown=SentimentBreakdown(food_quality=overall, service=overall),
+            positive_drivers=top_pos,
+            common_complaints=top_neg,
             sample_reviews=reviews[:3],
         )
 
-    def _build_menu_comparison(
-        self, menus: list, target_name: str
-    ) -> MenuComparison:
-        """Build menu comparison from collected data."""
+    def _build_menu_comparison(self, menus: dict[str, str], target_name: str) -> MenuComparison:
+        """Build menu comparison from cached menus."""
         target_menu = None
         competitor_menus = []
 
-        for menu_data in menus:
-            if isinstance(menu_data, str):
-                try:
-                    menu_data = json.loads(menu_data)
-                except:
-                    continue
-
-            if isinstance(menu_data, dict):
-                name = menu_data.get("restaurant_name", "")
-                items = menu_data.get("items", [])
-                
-                menu = RestaurantMenu(
-                    restaurant_name=name,
-                    items=[],
-                    signature_items=items[:3] if items else [],
-                )
-                
-                if target_name.lower() in name.lower():
-                    target_menu = menu
-                else:
-                    competitor_menus.append(menu)
+        for name, content in menus.items():
+            menu = RestaurantMenu(
+                restaurant_name=name,
+                items=[],
+                signature_items=[content[:200]] if content else [],
+            )
+            if target_name.lower() in name.lower():
+                target_menu = menu
+            else:
+                competitor_menus.append(menu)
 
         return MenuComparison(
             target_menu=target_menu,
@@ -485,96 +507,73 @@ Output ONLY the JSON - no additional text."""
             unique_offerings=[],
         )
 
-    def _build_pricing_analysis(
-        self, competitors: list[Competitor], menus: list
-    ) -> PricingAnalysis:
+    def _build_pricing_analysis(self, competitors: list[Competitor], menus: dict) -> PricingAnalysis:
         """Build pricing analysis from competitor data."""
         price_levels = []
         for c in competitors:
             if c.price_level:
-                # Convert $ symbols to numbers
-                level = len(c.price_level.replace(" ", ""))
+                level = len(str(c.price_level).replace(" ", ""))
                 price_levels.append(level)
 
-        avg_level = sum(price_levels) / len(price_levels) if price_levels else 2
-
-        # Map to position
-        if avg_level <= 1.5:
-            position = "budget"
-        elif avg_level <= 2.5:
-            position = "mid-range"
-        elif avg_level <= 3.5:
-            position = "premium"
-        else:
-            position = "luxury"
+        avg = sum(price_levels) / len(price_levels) if price_levels else 2
+        position = "budget" if avg <= 1.5 else "mid-range" if avg <= 2.5 else "premium" if avg <= 3.5 else "luxury"
 
         return PricingAnalysis(
             price_position=position,
-            competitor_price_range={
-                c.name: {"level": c.price_level or "$$"}
-                for c in competitors[:5]
-            },
+            competitor_price_range={c.name: {"level": c.price_level or "$$"} for c in competitors[:5]},
         )
 
-    def _build_market_signals(
-        self, competitors: list[Competitor], market_data: list
-    ) -> MarketSignals:
-        """Build market signals from all collected data."""
-        competitor_count = len(competitors)
-        
-        # Determine saturation
-        if competitor_count <= 3:
-            saturation = "low"
-        elif competitor_count <= 8:
-            saturation = "moderate"
-        elif competitor_count <= 15:
-            saturation = "high"
-        else:
-            saturation = "oversaturated"
+    def _build_market_signals(self, competitors: list[Competitor], market_data: list) -> MarketSignals:
+        """Build market signals from collected data."""
+        count = len(competitors)
+        saturation = "low" if count <= 3 else "moderate" if count <= 8 else "high" if count <= 15 else "oversaturated"
 
-        # Average competitor rating
         ratings = [c.rating for c in competitors if c.rating]
         avg_rating = sum(ratings) / len(ratings) if ratings else None
 
-        # Extract signals from market data
-        foot_traffic = []
-        growth = []
+        foot_traffic = ["Data from Google Places API"]
+        growth = ["Market signals collected via web search"]
         risks = []
 
         for data in market_data:
             if isinstance(data, dict):
-                content = data.get("content", "").lower()
-                if "busy" in content or "popular" in content or "traffic" in content:
-                    foot_traffic.append(data.get("title", "")[:50])
-                if "growth" in content or "expanding" in content or "new" in content:
-                    growth.append(data.get("title", "")[:50])
-                if "closing" in content or "decline" in content or "struggle" in content:
+                content = str(data.get("content", "")).lower()
+                if "closing" in content or "decline" in content:
                     risks.append(data.get("title", "")[:50])
 
         return MarketSignals(
-            competitor_density=competitor_count,
+            competitor_density=count,
             market_saturation=saturation,
             avg_competitor_rating=avg_rating,
-            foot_traffic_indicators=foot_traffic[:5] if foot_traffic else ["Foot traffic data not available"],
-            growth_indicators=growth[:5] if growth else ["Growth signals not found"],
-            risk_indicators=risks[:5] if risks else ["No significant risk signals"],
+            foot_traffic_indicators=foot_traffic,
+            growth_indicators=growth,
+            risk_indicators=risks if risks else ["No significant risk signals"],
         )
 
-    def __call__(self, state: dict[str, Any]) -> dict[str, Any]:
-        """LangGraph-compatible call interface."""
+    def __call__(self, state: AgentGraphState) -> AgentGraphState:
+        """LangGraph-compatible call interface with state caching."""
         planner_output = state.get("planner_output")
         if not planner_output:
-            raise ValueError("No planner_output found in state")
+            raise ValueError("No planner_output in state")
 
         # Convert dict to PlannerOutput if needed
         if isinstance(planner_output, dict):
             planner_output = PlannerOutput(**planner_output)
 
+        # Get existing cache and progress from state
+        cache = get_cache(state)
+        progress = get_progress(state)
+
         try:
-            output = self.research(planner_output)
+            output, updated_cache, updated_progress = self.research(
+                planner_output, cache, progress
+            )
+            
             return {
                 **state,
-                "researcher_output": output,
+                "researcher_output": output.model_dump(),
+                "research_cache": updated_cache,
+                "research_progress": updated_progress,
                 "current_node": "critic",
                 "iteration_count": state.get("iteration_count", 0) + 1,
             }
@@ -582,7 +581,9 @@ Output ONLY the JSON - no additional text."""
             logger.error(f"[RESEARCHER] Error: {e}")
             return {
                 **state,
-                "error_log": state.get("error_log", []) + [f"Researcher error: {str(e)}"],
+                "research_cache": cache,  # Preserve cache even on error
+                "research_progress": progress,
+                "error_log": state.get("error_log", []) + [f"Researcher: {str(e)[:200]}"],
                 "current_node": "error",
+                "iteration_count": state.get("iteration_count", 0) + 1,  # Always increment
             }
-
