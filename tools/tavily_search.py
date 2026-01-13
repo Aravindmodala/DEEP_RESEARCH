@@ -281,3 +281,4 @@ def create_tavily_tools(api_key: str | None = None) -> list:
 
     return [web_search, search_restaurant_market, search_foot_traffic, get_market_context]
 
+

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from loguru import logger
 
 from config import AgentConfig
+from models.schemas import CriticOutput, ResearchIssue
 from prompts import CRITIC_SYSTEM_PROMPT
 from utils import create_llm
 
@@ -19,57 +20,59 @@ class CriticAgent:
     NODE 3 — CRITIC AGENT
     
     Evaluates research quality using rule-based checks + LLM evaluation.
-    Returns plain dict (no strict validation - Report LLM can handle it).
+    Returns validated CriticOutput Pydantic model.
     """
 
     def __init__(self, config: AgentConfig):
         self.config = config
         self.llm = create_llm(config, temperature=0.0)
 
-    def evaluate(self, research: dict[str, Any]) -> dict[str, Any]:
+    def evaluate(
+        self,
+        user_query: str,
+        plan: dict[str, Any],
+        research: dict[str, Any],
+    ) -> CriticOutput:
         """
         Evaluate research quality and decide ACCEPT or REJECT.
         
         Args:
+            user_query: Original user request
+            plan: Planner output dict
             research: Research output dict from Researcher
             
         Returns:
-            Plain dict with evaluation results
+            Validated CriticOutput Pydantic model
         """
         logger.info("[CRITIC] Evaluating research quality...")
 
-        # Rule-based checks on dict keys
-        rule_issues = self._rule_based_evaluation(research)
-
-        # LLM evaluation
+        # LLM evaluation (keep the prompt compact; do not dump entire state)
         messages = [
             SystemMessage(content=CRITIC_SYSTEM_PROMPT),
-            HumanMessage(content=self._format_research_for_review(research)),
+            HumanMessage(content=self._format_research_for_review(user_query, plan, research)),
         ]
 
         response = self.llm.invoke(messages)
         llm_evaluation = self._parse_llm_evaluation(response.content)
 
-        # Combine issues
-        all_issues = rule_issues + llm_evaluation.get("issues", [])
+        # Use only LLM issues (less strict, avoids false negatives from deterministic rules)
+        all_issues = llm_evaluation.get("issues", [])
 
         # Calculate quality score
         quality_score = self._calculate_quality_score(research, all_issues)
 
-        # Determine decision
-        critical_issues = [i for i in all_issues if i.get("severity") == "critical"]
-        major_issues = [i for i in all_issues if i.get("severity") == "major"]
+        # Determine decision (less strict)
+        # Only REJECT if core research is missing (hard blocker)
+        competitors = research.get("competitors", []) if isinstance(research, dict) else []
+        target = research.get("target") if isinstance(research, dict) else None
+        core_ok = bool(target) and isinstance(competitors, list) and len(competitors) >= 3
 
-        if critical_issues:
-            decision = "REJECT"
-            required_fixes = [f"CRITICAL: {i.get('description', '')}" for i in critical_issues]
-        elif quality_score < self.config.min_quality_score:
-            decision = "REJECT"
-            required_fixes = [f"Quality score {quality_score:.2f} below threshold {self.config.min_quality_score}"]
-            required_fixes.extend([f"MAJOR: {i.get('description', '')}" for i in major_issues])
-        else:
-            decision = "ACCEPT"
-            required_fixes = []
+        decision: Literal["ACCEPT", "REJECT"] = "ACCEPT" if core_ok else "REJECT"
+        required_fixes = []
+        if decision == "REJECT":
+            required_fixes = [
+                "Provide target restaurant identification (name/place_id/address) and at least 3 competitors with ratings/distances."
+            ]
 
         # Identify strengths
         strengths = self._identify_strengths(research)
@@ -77,163 +80,142 @@ class CriticAgent:
         # Banking suitability assessment
         banking_assessment = self._assess_banking_suitability(research, all_issues)
 
-        output = {
-            "decision": decision,
-            "overall_quality_score": quality_score,
-            "issues_found": all_issues,
-            "required_fixes": required_fixes,
-            "strengths": strengths,
-            "banking_suitability_assessment": banking_assessment,
-        }
+        # Convert issues to ResearchIssue models
+        issues_models = []
+        for issue in all_issues:
+            severity = issue.get("severity", "minor")
+            # Ensure severity is valid
+            if severity not in ("critical", "major", "minor"):
+                severity = "minor"
+            issues_models.append(ResearchIssue(
+                severity=severity,
+                category=issue.get("category", "general"),
+                description=issue.get("description", ""),
+                affected_section=issue.get("affected_section"),
+            ))
+
+        output = CriticOutput(
+            decision=decision,
+            overall_quality_score=quality_score,
+            issues_found=issues_models,
+            required_fixes=required_fixes,
+            strengths=strengths,
+            banking_suitability_assessment=banking_assessment,
+        )
 
         logger.info(f"[CRITIC] Decision: {decision}")
         logger.info(f"[CRITIC] Quality Score: {quality_score:.2f}")
-        logger.info(f"[CRITIC] Issues found: {len(all_issues)}")
+        logger.info(f"[CRITIC] Issues found: {len(issues_models)}")
 
         return output
 
-    def _rule_based_evaluation(self, research: dict[str, Any]) -> list[dict]:
-        """Perform deterministic rule-based checks on research dict."""
-        issues = []
-        
-        competitors = research.get("competitors", [])
-        menu_comparison = research.get("menu_comparison")
-        sentiment_analysis = research.get("sentiment_analysis")
-        market_signals = research.get("market_signals")
-        pricing_analysis = research.get("pricing_analysis")
-        raw_sources = research.get("raw_sources", [])
+    def _compact_research_for_review(self, research: dict[str, Any]) -> dict[str, Any]:
+        """Create a compact representation of research for Critic prompting."""
+        competitors = research.get("competitors", []) if isinstance(research, dict) else []
+        menu = research.get("menu_comparison", {}) if isinstance(research, dict) else {}
+        pricing = research.get("pricing_analysis", {}) if isinstance(research, dict) else {}
+        market = research.get("market_signals", {}) if isinstance(research, dict) else {}
+        sentiment = research.get("sentiment_analysis", {}) if isinstance(research, dict) else {}
+        sources = research.get("raw_sources", []) if isinstance(research, dict) else []
 
-        # Check competitor data
-        if not competitors:
-            issues.append({
-                "severity": "critical",
-                "category": "completeness",
-                "description": "No competitor data found",
-                "affected_section": "competitors",
-            })
-        elif len(competitors) < 3:
-            issues.append({
-                "severity": "major",
-                "category": "completeness",
-                "description": f"Only {len(competitors)} competitors found (minimum 3 expected)",
-                "affected_section": "competitors",
-            })
+        # Keep only a few competitors (selected set, not "found")
+        competitors_compact = []
+        if isinstance(competitors, list):
+            for c in competitors[:5]:
+                if isinstance(c, dict):
+                    competitors_compact.append(
+                        {
+                            "name": c.get("name"),
+                            "distance_miles": c.get("distance_miles"),
+                            "rating": c.get("rating"),
+                            "review_count": c.get("review_count"),
+                            "price_level": c.get("price_level"),
+                            "website": c.get("website"),
+                            "place_id": c.get("place_id"),
+                        }
+                    )
 
-        # Check for competitor ratings
-        if competitors:
-            competitors_with_ratings = [c for c in competitors if c.get("rating")]
-            if len(competitors_with_ratings) < len(competitors) * 0.5:
-                issues.append({
-                    "severity": "minor",
-                    "category": "completeness",
-                    "description": "Less than 50% of competitors have ratings data",
-                    "affected_section": "competitors",
-                })
+        # Summarize menu extraction without dumping raw page content
+        menu_compact: dict[str, Any] = {"target_menu_present": False, "competitor_menu_count": 0}
+        if isinstance(menu, dict):
+            target_menu = menu.get("target_menu")
+            competitor_menus = menu.get("competitor_menus", [])
+            menu_compact["target_menu_present"] = bool(target_menu)
+            if isinstance(competitor_menus, list):
+                menu_compact["competitor_menu_count"] = len(competitor_menus)
+                menu_compact["competitor_menus_sample"] = [
+                    {
+                        "restaurant_name": m.get("restaurant_name"),
+                        "source_url": m.get("source_url"),
+                        "status": m.get("status"),
+                        "content_length": m.get("content_length"),
+                    }
+                    for m in competitor_menus[:3]
+                    if isinstance(m, dict)
+                ]
 
-        # Check menu data
-        if self.config.require_menu_data:
-            if not menu_comparison or not menu_comparison.get("target_menu"):
-                issues.append({
-                    "severity": "major",
-                    "category": "completeness",
-                    "description": "Target restaurant menu data not extracted",
-                    "affected_section": "menu_comparison",
-                })
+        # Strip raw reviews to reduce payload
+        sentiment_compact = {}
+        if isinstance(sentiment, dict):
+            sentiment_compact = {
+                "comparative_summary": sentiment.get("comparative_summary", ""),
+                "restaurants": sentiment.get("restaurants", [])[:5] if isinstance(sentiment.get("restaurants"), list) else [],
+            }
 
-        # Check sentiment data
-        if self.config.require_sentiment_data:
-            if not sentiment_analysis:
-                issues.append({
-                    "severity": "major",
-                    "category": "completeness",
-                    "description": "Sentiment analysis missing",
-                    "affected_section": "sentiment_analysis",
-                })
-            elif not sentiment_analysis.get("restaurants") and not sentiment_analysis.get("raw_reviews"):
-                issues.append({
-                    "severity": "minor",
-                    "category": "completeness",
-                    "description": "Sentiment analysis lacks restaurant reviews",
-                    "affected_section": "sentiment_analysis",
-                })
+        # Keep sources minimal
+        sources_compact = []
+        if isinstance(sources, list):
+            for s in sources[:5]:
+                if isinstance(s, dict):
+                    sources_compact.append(
+                        {
+                            "source_type": s.get("source_type"),
+                            "title": s.get("title"),
+                            "url": s.get("url"),
+                            "accessed_at": s.get("accessed_at"),
+                        }
+                    )
 
-        # Check market signals
-        if not market_signals:
-            issues.append({
-                "severity": "major",
-                "category": "completeness",
-                "description": "Market signals analysis missing",
-                "affected_section": "market_signals",
-            })
+        return {
+            "target": research.get("target"),
+            "selected_competitors": competitors_compact,
+            "menu_summary": menu_compact,
+            "pricing_analysis": pricing,
+            "market_signals": market,
+            "sentiment_analysis": sentiment_compact,
+            "sources": sources_compact,
+        }
 
-        # Check pricing analysis
-        if not pricing_analysis or not pricing_analysis.get("price_position"):
-            issues.append({
-                "severity": "minor",
-                "category": "completeness",
-                "description": "Price positioning not determined",
-                "affected_section": "pricing_analysis",
-            })
+    def _format_research_for_review(self, user_query: str, plan: dict[str, Any], research: dict[str, Any]) -> str:
+        """Format a compact critique prompt for the Critic LLM."""
+        plan_summary = {
+            "target_restaurant": plan.get("target_restaurant"),
+            "location": plan.get("location"),
+            "cuisine_type": plan.get("cuisine_type"),
+            "intent": plan.get("intent"),
+        }
+        compact = self._compact_research_for_review(research)
 
-        # Check source grounding
-        if not raw_sources:
-            issues.append({
-                "severity": "major",
-                "category": "grounding",
-                "description": "No source references provided",
-                "affected_section": "raw_sources",
-            })
-        elif len(raw_sources) < 3:
-            issues.append({
-                "severity": "minor",
-                "category": "grounding",
-                "description": f"Only {len(raw_sources)} sources cited (minimum 3 expected)",
-                "affected_section": "raw_sources",
-            })
+        return f"""## User Request
+{user_query}
 
-        return issues
-
-    def _format_research_for_review(self, research: dict[str, Any]) -> str:
-        """Format research output for LLM review."""
-        competitors = research.get("competitors", [])
-        
-        return f"""## Research Output for Review
-
-### Competitors ({len(competitors)} found)
+## Research Plan (high level)
 ```json
-{json.dumps(competitors[:5], indent=2, default=str)}
+{json.dumps(plan_summary, indent=2, default=str)}
 ```
 
-### Menu Comparison
+## Research Output (compact)
 ```json
-{json.dumps(research.get("menu_comparison"), indent=2, default=str)}
+{json.dumps(compact, indent=2, default=str)}
 ```
 
-### Pricing Analysis
-```json
-{json.dumps(research.get("pricing_analysis"), indent=2, default=str)}
-```
+## Task
+Provide a constructive critique of the research output:
+- What are the top gaps or risks?
+- What should be improved next to strengthen the final report?
+- Point out any obvious inconsistencies (if any).
 
-### Sentiment Analysis
-```json
-{json.dumps(research.get("sentiment_analysis"), indent=2, default=str)}
-```
-
-### Market Signals
-```json
-{json.dumps(research.get("market_signals"), indent=2, default=str)}
-```
-
-### Sources ({len(research.get("raw_sources", []))} total)
-```json
-{json.dumps(research.get("raw_sources", [])[:5], indent=2, default=str)}
-```
-
-### Research Notes
-{research.get("research_notes", [])}
-
----
-Evaluate this research for commercial banking suitability. Output your evaluation as JSON."""
+Output your evaluation as JSON using the required schema."""
 
     def _parse_llm_evaluation(self, response_text: str) -> dict:
         """Parse LLM evaluation response."""
@@ -371,22 +353,22 @@ Evaluate this research for commercial banking suitability. Output your evaluatio
         try:
             output = self.evaluate(researcher_output)  # researcher_output is already a dict
 
-            if output["decision"] == "ACCEPT":
+            if output.decision == "ACCEPT":
                 next_node = "report"
             else:
                 iteration = state.get("iteration_count", 0)
                 max_iter = state.get("max_iterations", self.config.max_research_iterations)
                 if iteration >= max_iter:
                     logger.warning(f"[CRITIC] Max iterations ({max_iter}) reached. Forcing accept.")
-                    output["decision"] = "ACCEPT"
-                    output["required_fixes"] = []
+                    output.decision = "ACCEPT"
+                    output.required_fixes = []
                     next_node = "report"
                 else:
                     next_node = "researcher"
 
             return {
                 **state,
-                "critic_output": output,  # Plain dict
+                "critic_output": output.model_dump(),  # Convert Pydantic to dict for state
                 "current_node": next_node,
             }
         except Exception as e:

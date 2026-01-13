@@ -16,7 +16,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from models.schemas import Competitor
+from models.schemas import CompetitorInfo
 
 
 class PlaceSearchResult(BaseModel):
@@ -247,7 +247,7 @@ class GoogleMapsTools:
         location: str,
         cuisine_type: str = "restaurant",
         radius_meters: int = 3000,
-    ) -> tuple[PlaceSearchResult | None, list[Competitor]]:
+    ) -> tuple[PlaceSearchResult | None, list[CompetitorInfo]]:
         """
         Full workflow: find target, find competitors, calculate distances.
         Uses ONLY Places API + Haversine formula.
@@ -287,7 +287,7 @@ class GoogleMapsTools:
         )
 
         # Build competitor list with distances calculated via Haversine
-        competitors: list[Competitor] = []
+        competitors: list[CompetitorInfo] = []
         for place in nearby:
             # Skip the target restaurant itself
             if place.place_id == target.place_id:
@@ -310,7 +310,7 @@ class GoogleMapsTools:
                 pass
 
             competitors.append(
-                Competitor(
+                CompetitorInfo(
                     name=place.name,
                     address=place.address,
                     distance_miles=distance,

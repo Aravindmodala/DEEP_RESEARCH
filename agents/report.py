@@ -10,7 +10,6 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from loguru import logger
 
 from config import AgentConfig
-from models.schemas import ReportOutput, SourceReference
 from prompts import REPORT_SYSTEM_PROMPT
 from utils import create_llm
 
@@ -19,27 +18,22 @@ class ReportAgent:
     """
     NODE 4 — REPORT AGENT
     
-    Generates a client-ready Market Research Report using LLM with structured output.
-    
-    This is the ONLY agent that uses Pydantic validation because the final
-    report needs a guaranteed structure for UI rendering.
+    Generates a client-ready Market Research Report using LLM.
+    Returns markdown report text.
     """
 
     def __init__(self, config: AgentConfig):
         self.config = config
-        base_llm = create_llm(config, temperature=0.3)
-        self.llm = base_llm.with_structured_output(ReportOutput)
+        self.llm = create_llm(config, temperature=0.3)
 
     def generate(
         self,
         plan: dict[str, Any],
         research: dict[str, Any],
         critique: dict[str, Any],
-    ) -> ReportOutput:
+    ) -> str:
         """
         Generate a comprehensive market research report.
-        
-        All inputs are plain dicts - only the output is validated.
         
         Args:
             plan: Research plan dict from Planner
@@ -47,7 +41,7 @@ class ReportAgent:
             critique: Quality assessment dict from Critic
             
         Returns:
-            ReportOutput (validated Pydantic model for UI rendering)
+            Markdown report text
         """
         target = plan.get("target_restaurant", "Unknown")
         location = plan.get("location", "Unknown")
@@ -61,24 +55,12 @@ class ReportAgent:
             HumanMessage(content=context),
         ]
 
-        # LLM generates structured output directly
-        report: ReportOutput = self.llm.invoke(messages)
-
-        # Override metadata fields with actual values
-        report.report_title = f"Market Research Report: {target}"
-        report.generated_at = datetime.now().isoformat()
-        report.target_restaurant = target
-        report.location = location
-        
-        # Convert raw_sources to SourceReference objects
-        raw_sources = research.get("raw_sources", [])
-        report.appendix_sources = [
-            SourceReference(**s) if isinstance(s, dict) else s
-            for s in raw_sources
-        ]
+        # LLM generates markdown report
+        response = self.llm.invoke(messages)
+        report_text = response.content if hasattr(response, 'content') else str(response)
 
         logger.info("[REPORT] Report generation complete")
-        return report
+        return report_text
 
     def _prepare_context(
         self,
@@ -126,7 +108,7 @@ class ReportAgent:
 - **Cuisine Type:** {cuisine_type}
 - **Research Intent:** {intent}
 
-### Competitors ({len(competitors)} found)
+### Selected Competitors
 ```json
 {json.dumps(competitor_summary, indent=2, default=str)}
 ```
@@ -180,10 +162,10 @@ Synthesize insights, don't just repeat data. Think like a commercial banker eval
         # All inputs are dicts - no conversion needed
 
         try:
-            report = self.generate(planner_output, researcher_output, critic_output)
+            report_text = self.generate(planner_output, researcher_output, critic_output)
             return {
                 **state,
-                "report_output": report.model_dump(),  # Convert to dict for state
+                "report_output": report_text,  # Store as markdown string
                 "current_node": "complete",
                 "completed_at": datetime.now().isoformat(),
             }

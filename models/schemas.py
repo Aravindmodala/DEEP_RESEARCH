@@ -1,14 +1,14 @@
-"""Pydantic schemas - Only for final report output that needs guaranteed structure."""
+"""Pydantic schemas for all agent outputs with guaranteed structure."""
 
 from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # =============================================================================
-# SOURCE REFERENCE (used in report appendix)
+# SOURCE REFERENCE (shared across agents)
 # =============================================================================
 
 
@@ -20,6 +20,151 @@ class SourceReference(BaseModel):
     title: str | None = None
     accessed_at: str | None = None
     data_summary: str | None = None
+
+
+# =============================================================================
+# PLANNER OUTPUT
+# =============================================================================
+
+
+class PlannerOutput(BaseModel):
+    """
+    Structured output from the Planner Agent.
+    
+    Converts user's natural-language request into a research plan.
+    """
+
+    target_restaurant: str = "Unknown"
+    location: str = "Unknown"
+    cuisine_type: str = "unknown"
+    intent: str = ""
+    search_queries: list[str] = Field(default_factory=list)
+    research_focus: list[str] = Field(default_factory=list)
+    priority_areas: list[str] = Field(default_factory=list)
+
+
+# =============================================================================
+# RESEARCHER OUTPUT
+# =============================================================================
+
+
+class RestaurantInfo(BaseModel):
+    """Basic restaurant information."""
+
+    name: str = "Unknown"
+    address: str = ""
+    place_id: str | None = None
+    rating: float | None = None
+    review_count: int | None = None
+    price_level: str | None = None
+    cuisine_type: str = "restaurant"
+    website: str | None = None
+
+
+class CompetitorInfo(BaseModel):
+    """Competitor restaurant information."""
+
+    name: str = "Unknown"
+    address: str = ""
+    distance_miles: float = 0.0
+    rating: float | None = None
+    review_count: int | None = None
+    price_level: str | None = None
+    cuisine_type: str = "restaurant"
+    website: str | None = None
+    place_id: str | None = None
+
+
+class MenuComparison(BaseModel):
+    """Menu comparison data."""
+
+    target_menu: dict[str, Any] | None = None
+    competitor_menus: list[dict[str, Any]] = Field(default_factory=list)
+    unique_offerings: list[str] = Field(default_factory=list)
+
+
+class PricingAnalysis(BaseModel):
+    """Pricing analysis data."""
+
+    price_position: str = "unknown"
+    target_avg_price: float | None = None
+    market_avg_price: float | None = None
+    competitor_price_range: dict[str, Any] = Field(default_factory=dict)
+
+
+class RestaurantSentiment(BaseModel):
+    """Sentiment analysis for a single restaurant."""
+
+    name: str = ""
+    sentiment_score: float = 0.5
+    key_strengths: list[str] = Field(default_factory=list)
+    key_concerns: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
+class SentimentAnalysis(BaseModel):
+    """Sentiment analysis results."""
+
+    restaurants: list[RestaurantSentiment] = Field(default_factory=list)
+    comparative_summary: str = ""
+    raw_reviews: dict[str, Any] = Field(default_factory=dict)
+
+
+class MarketSignals(BaseModel):
+    """Market signals and indicators."""
+
+    competitor_density: int = 0
+    market_saturation: str = "unknown"
+    avg_competitor_rating: float | None = None
+    foot_traffic_indicators: list[str] = Field(default_factory=list)
+    growth_indicators: list[str] = Field(default_factory=list)
+    risk_indicators: list[str] = Field(default_factory=list)
+
+
+class ResearcherOutput(BaseModel):
+    """
+    Structured output from the Researcher Agent.
+    
+    Contains all research findings from the autonomous ReAct loop.
+    """
+
+    target: RestaurantInfo | None = None
+    competitors: list[CompetitorInfo] = Field(default_factory=list)
+    menu_comparison: MenuComparison = Field(default_factory=MenuComparison)
+    pricing_analysis: PricingAnalysis = Field(default_factory=PricingAnalysis)
+    sentiment_analysis: SentimentAnalysis = Field(default_factory=SentimentAnalysis)
+    market_signals: MarketSignals = Field(default_factory=MarketSignals)
+    raw_sources: list[SourceReference] = Field(default_factory=list)
+    research_notes: list[str] = Field(default_factory=list)
+
+
+# =============================================================================
+# CRITIC OUTPUT
+# =============================================================================
+
+
+class ResearchIssue(BaseModel):
+    """An issue found during research evaluation."""
+
+    severity: Literal["critical", "major", "minor"] = "minor"
+    category: str = "general"
+    description: str = ""
+    affected_section: str | None = None
+
+
+class CriticOutput(BaseModel):
+    """
+    Structured output from the Critic Agent.
+    
+    Evaluates research quality and determines ACCEPT/REJECT decision.
+    """
+
+    decision: Literal["ACCEPT", "REJECT"] = "REJECT"
+    overall_quality_score: float = 0.0
+    issues_found: list[ResearchIssue] = Field(default_factory=list)
+    required_fixes: list[str] = Field(default_factory=list)
+    strengths: list[str] = Field(default_factory=list)
+    banking_suitability_assessment: str = ""
 
 
 # =============================================================================
@@ -36,13 +181,32 @@ class ExecutiveSummary(BaseModel):
     expansion_implications: str = ""
 
 
+class TopCompetitor(BaseModel):
+    """Structured competitor item for report rendering / structured output."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = ""
+    distance_miles: float | None = None
+    rating: float | None = None
+    review_count: int | None = None
+    price_level: str | None = None
+    cuisine_type: str | None = None
+    website: str | None = None
+    place_id: str | None = None
+
+
 class CompetitiveLandscapeSection(BaseModel):
     """Competitive landscape section."""
 
     summary: str = ""
     competitor_count: int = 0
     market_saturation_level: str = "unknown"
-    top_competitors: list[dict[str, Any]] = Field(default_factory=list)
+
+    # NOTE: We must avoid `dict[str, Any]` here because OpenAI structured output
+    # requires JSON schemas with `additionalProperties: false` for object items.
+    # Using a concrete Pydantic model with `extra="forbid"` produces a valid schema.
+    top_competitors: list[TopCompetitor] = Field(default_factory=list)
     competitive_advantages: list[str] = Field(default_factory=list)
     competitive_disadvantages: list[str] = Field(default_factory=list)
 
@@ -92,10 +256,7 @@ class ReportOutput(BaseModel):
     """
     Final structured report from the Report Agent.
     
-    This is the ONLY model that needs strict validation because:
-    1. It gets rendered into a document/UI
-    2. It's the final deliverable to the user
-    3. It needs guaranteed structure for downstream processing
+    This model is rendered into a document/UI and needs guaranteed structure.
     """
 
     report_title: str = ""

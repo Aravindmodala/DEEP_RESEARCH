@@ -11,6 +11,17 @@ from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from loguru import logger
 
 from config import AgentConfig
+from models.schemas import (
+    CompetitorInfo,
+    MarketSignals,
+    MenuComparison,
+    PricingAnalysis,
+    ResearcherOutput,
+    RestaurantInfo,
+    RestaurantSentiment,
+    SentimentAnalysis,
+    SourceReference,
+)
 from prompts import RESEARCHER_SYSTEM_PROMPT
 from tools.google_maps import create_google_maps_tools
 from tools.tavily_search import create_tavily_tools
@@ -24,7 +35,7 @@ class ResearcherAgent:
     NODE 2 — RESEARCHER AGENT (AUTONOMOUS)
     
     Executes research plan using ReAct loop.
-    Returns plain dict (no strict validation).
+    Returns validated ResearcherOutput Pydantic model.
     """
 
     MAX_REACT_ITERATIONS = 15
@@ -65,7 +76,7 @@ class ResearcherAgent:
 
         return tools
 
-    def research(self, plan: dict[str, Any]) -> dict[str, Any]:
+    def research(self, plan: dict[str, Any]) -> ResearcherOutput:
         """
         Execute research based on the planner's output.
         
@@ -73,7 +84,7 @@ class ResearcherAgent:
             plan: Research plan dict from Planner
             
         Returns:
-            Plain dict with research findings
+            Validated ResearcherOutput Pydantic model
         """
         target = plan.get("target_restaurant", "Unknown")
         location = plan.get("location", "Unknown")
@@ -145,7 +156,7 @@ class ResearcherAgent:
         # Build output
         output = self._build_output(collected_data, plan, sentiment_analysis)
         
-        logger.info(f"[RESEARCHER] Research complete. Found {len(output.get('competitors', []))} competitors")
+        logger.info(f"[RESEARCHER] Research complete. Found {len(output.competitors)} competitors")
         return output
 
     def _format_plan_message(self, plan: dict[str, Any]) -> str:
@@ -361,52 +372,101 @@ Output as JSON:
             "raw_reviews": reviews_data,
         }
 
-    def _build_output(self, collected_data: dict, plan: dict[str, Any], sentiment_analysis: dict) -> dict[str, Any]:
-        """Build research output dict from collected data."""
+    def _convert_price_level(self, level: int | str | None) -> str | None:
+        """Convert price_level from int to string representation."""
+        if level is None:
+            return None
+        if isinstance(level, str):
+            return level  # Already a string
+        # Convert int to string representation
+        mapping = {0: "$", 1: "$", 2: "$$", 3: "$$$", 4: "$$$$"}
+        return mapping.get(level, "$$")
+
+    def _build_output(self, collected_data: dict, plan: dict[str, Any], sentiment_analysis: dict) -> ResearcherOutput:
+        """Build validated ResearcherOutput from collected data."""
         target = plan.get("target_restaurant", "Unknown")
         location = plan.get("location", "Unknown")
+        
+        # Process target restaurant
+        target_data = collected_data.get("target")
+        target_info = None
+        if target_data and isinstance(target_data, dict):
+            target_info = RestaurantInfo(
+                name=target_data.get("name", "Unknown"),
+                address=target_data.get("address", ""),
+                place_id=target_data.get("place_id"),
+                rating=target_data.get("rating"),
+                review_count=target_data.get("user_ratings_total") or target_data.get("review_count"),
+                price_level=self._convert_price_level(target_data.get("price_level")),
+                cuisine_type=target_data.get("cuisine_type", "restaurant"),
+                website=target_data.get("website"),
+            )
         
         # Process competitors
         competitors = []
         for c in collected_data.get("competitors", []):
             if isinstance(c, dict):
-                competitors.append({
-                    "name": c.get("name", "Unknown"),
-                    "address": c.get("address", ""),
-                    "distance_miles": c.get("distance_miles", 0.0),
-                    "rating": c.get("rating"),
-                    "review_count": c.get("review_count") or c.get("user_ratings_total"),
-                    "price_level": c.get("price_level"),
-                    "cuisine_type": c.get("cuisine_type", "restaurant"),
-                    "website": c.get("website"),
-                    "place_id": c.get("place_id"),
-                })
+                competitors.append(CompetitorInfo(
+                    name=c.get("name", "Unknown"),
+                    address=c.get("address", ""),
+                    distance_miles=c.get("distance_miles", 0.0),
+                    rating=c.get("rating"),
+                    review_count=c.get("review_count") or c.get("user_ratings_total"),
+                    price_level=self._convert_price_level(c.get("price_level")),
+                    cuisine_type=c.get("cuisine_type", "restaurant"),
+                    website=c.get("website"),
+                    place_id=c.get("place_id"),
+                ))
         
         competitors = competitors[:self.config.max_competitors]
 
         # Build pricing analysis
-        pricing = self._build_pricing_analysis(competitors)
+        pricing_dict = self._build_pricing_analysis([c.model_dump() for c in competitors])
+        pricing = PricingAnalysis(**pricing_dict)
 
         # Build market signals
-        market_signals = self._build_market_signals(competitors, collected_data.get("market_data", []))
+        market_signals_dict = self._build_market_signals(
+            [c.model_dump() for c in competitors], 
+            collected_data.get("market_data", [])
+        )
+        market_signals = MarketSignals(**market_signals_dict)
 
         # Build menu comparison
-        menu_comparison = self._build_menu_comparison(collected_data.get("menus", []), target)
+        menu_dict = self._build_menu_comparison(collected_data.get("menus", []), target)
+        menu_comparison = MenuComparison(**menu_dict)
 
-        return {
-            "target": collected_data.get("target"),
-            "competitors": competitors,
-            "menu_comparison": menu_comparison,
-            "pricing_analysis": pricing,
-            "sentiment_analysis": sentiment_analysis,  # LLM-analyzed sentiment
-            "market_signals": market_signals,
-            "raw_sources": collected_data.get("sources", []),
-            "research_notes": [
+        # Build sentiment analysis
+        restaurants_sentiment = []
+        for r in sentiment_analysis.get("restaurants", []):
+            if isinstance(r, dict):
+                restaurants_sentiment.append(RestaurantSentiment(**r))
+        
+        sentiment = SentimentAnalysis(
+            restaurants=restaurants_sentiment,
+            comparative_summary=sentiment_analysis.get("comparative_summary", ""),
+            raw_reviews=sentiment_analysis.get("raw_reviews", {}),
+        )
+
+        # Build source references
+        sources = []
+        for s in collected_data.get("sources", []):
+            if isinstance(s, dict):
+                sources.append(SourceReference(**s))
+
+        return ResearcherOutput(
+            target=target_info,
+            competitors=competitors,
+            menu_comparison=menu_comparison,
+            pricing_analysis=pricing,
+            sentiment_analysis=sentiment,
+            market_signals=market_signals,
+            raw_sources=sources,
+            research_notes=[
                 f"Analyzed {len(competitors)} competitors in {location}",
                 f"Collected reviews for {len(sentiment_analysis.get('raw_reviews', {}))} restaurants",
                 f"Research intent: {plan.get('intent', 'Unknown')}",
             ],
-        }
+        )
 
     def _extract_json(self, text: str) -> dict | None:
         """Extract JSON from text."""
@@ -510,11 +570,18 @@ Output as JSON:
             if isinstance(menu_data, str):
                 try:
                     menu_data = json.loads(menu_data)
-                except:
-                    continue
+                except Exception:
+                    # Don't drop raw menu content; keep it as unstructured fallback
+                    menu_data = {
+                        "type": "menu_extraction_unstructured",
+                        "restaurant_name": "",
+                        "source_url": None,
+                        "status": "unknown",
+                        "raw_content": menu_data[:12000],
+                    }
 
             if isinstance(menu_data, dict):
-                name = menu_data.get("restaurant_name", "")
+                name = menu_data.get("restaurant_name", "") or menu_data.get("Restaurant", "")
                 if target_name.lower() in name.lower():
                     target_menu = menu_data
                 else:
@@ -536,7 +603,7 @@ Output as JSON:
             output = self.research(planner_output)
             return {
                 **state,
-                "researcher_output": output,
+                "researcher_output": output.model_dump(),  # Convert Pydantic to dict for state
                 "current_node": "critic",
                 "iteration_count": state.get("iteration_count", 0) + 1,
             }

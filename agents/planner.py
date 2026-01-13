@@ -15,6 +15,7 @@ from rich.prompt import Prompt
 from tavily import TavilyClient
 
 from config import AgentConfig
+from models.schemas import PlannerOutput
 from prompts import PLANNER_SYSTEM_PROMPT
 from utils import create_llm
 
@@ -27,7 +28,7 @@ class PlannerAgent:
     NODE 1 — PLANNER AGENT
     
     Converts user's natural-language request into a research plan.
-    Returns a plain dict (no strict validation needed - Researcher LLM can handle it).
+    Returns a validated PlannerOutput Pydantic model.
     """
 
     def __init__(self, config: AgentConfig):
@@ -42,12 +43,11 @@ class PlannerAgent:
             self.tavily = None
             logger.warning("[PLANNER] Tavily API key not found - cuisine detection may be limited")
 
-    def plan(self, user_query: str) -> dict[str, Any]:
+    def plan(self, user_query: str) -> PlannerOutput:
         """
         Convert a user query into a research plan.
         
-        Returns plain dict - no strict validation needed since the
-        Researcher agent (an LLM) can interpret flexible data.
+        Returns validated PlannerOutput Pydantic model.
         """
         logger.info(f"[PLANNER] Processing query: {user_query[:100]}...")
 
@@ -57,27 +57,32 @@ class PlannerAgent:
         ]
 
         response = self.llm.invoke(messages)
-        plan = self._extract_json(response.content)
+        plan_dict = self._extract_json(response.content)
 
-        if not plan:
+        if not plan_dict:
             logger.error("[PLANNER] Failed to extract JSON from response")
             # Return minimal plan rather than failing
-            plan = {
+            plan_dict = {
                 "target_restaurant": "Unknown",
                 "location": "Unknown",
                 "intent": user_query,
                 "search_queries": [user_query],
             }
 
-        logger.info(f"[PLANNER] Plan created for {plan.get('target_restaurant', 'Unknown')}")
-        return plan
+        # Validate and return as Pydantic model
+        output = PlannerOutput(**plan_dict)
+        logger.info(f"[PLANNER] Plan created for {output.target_restaurant}")
+        return output
 
-    def plan_with_confirmation(self, user_query: str) -> dict[str, Any]:
+    def plan_with_confirmation(self, user_query: str) -> PlannerOutput:
         """Generate a research plan with human confirmation."""
         console.print("\n[bold cyan]Analyzing your request...[/bold cyan]\n")
         
-        # Generate initial plan
-        plan = self.plan(user_query)
+        # Generate initial plan (returns PlannerOutput)
+        plan_output = self.plan(user_query)
+        
+        # Convert to dict for interactive editing
+        plan = plan_output.model_dump()
         
         # Detect cuisine type via web search
         console.print("[dim]Detecting cuisine type from web sources...[/dim]")
@@ -106,7 +111,7 @@ class PlannerAgent:
             
             if choice == "y":
                 console.print("\n[bold green]✓ Plan confirmed! Starting research...[/bold green]\n")
-                return plan
+                return PlannerOutput(**plan)
             elif choice == "e":
                 plan = self._interactive_edit_plan(plan)
             elif choice == "q":
@@ -270,10 +275,10 @@ Do not include any explanation."""
             raise ValueError("No user_query found in state")
 
         try:
-            plan = self.plan(user_query)
+            output = self.plan(user_query)
             return {
                 **state,
-                "planner_output": plan,  # Plain dict, not Pydantic model
+                "planner_output": output.model_dump(),  # Convert Pydantic to dict for state
                 "current_node": "researcher",
             }
         except Exception as e:

@@ -220,3 +220,4 @@ def _create_ollama(
         base_url=config.ollama_base_url,
     )
 
+

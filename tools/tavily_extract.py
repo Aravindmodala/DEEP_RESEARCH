@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime
 from typing import Any
 
 from langchain_core.tools import tool
@@ -220,25 +222,19 @@ Content:
         logger.info(f"[TOOL] Extracting menu for {restaurant_name} from: {url}")
         result = extractor.extract_single(url)
         
-        if not result.success:
-            return f"Failed to extract menu from {url}: {result.error}"
-        
-        return f"""
-=== MENU EXTRACTION ===
-Restaurant: {restaurant_name}
-Source URL: {url}
-Status: Successfully extracted
+        payload: dict[str, Any] = {
+            "type": "menu_extraction",
+            "restaurant_name": restaurant_name,
+            "source_url": url,
+            "status": "success" if result.success else "failed",
+            "error": None if result.success else result.error,
+            # Keep content but cap size to avoid blowing up state/LLM context
+            "content_length": len(result.raw_content or ""),
+            "raw_content": (result.raw_content or "")[:12000],
+            "extracted_at": datetime.now().isoformat(),
+        }
 
-=== RAW CONTENT ===
-{result.raw_content}
-
-=== INSTRUCTIONS FOR LLM ===
-Analyze the above content to identify:
-1. Menu categories (appetizers, mains, desserts, drinks, etc.)
-2. Individual menu items with names
-3. Prices for each item
-4. Any special offerings or signature dishes
-"""
+        return json.dumps(payload)
 
     @tool
     def extract_business_info(url: str, business_name: str) -> str:
@@ -281,4 +277,5 @@ Source URL: {url}
         extract_menu_page,
         extract_business_info,
     ]
+
 
