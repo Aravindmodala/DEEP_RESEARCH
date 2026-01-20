@@ -158,10 +158,33 @@ class GoogleMapsTools:
                 # Just use text search with location in query
                 result = self.client.places(query=query)
 
+            # Types to EXCLUDE (not sit-down restaurants)
+            excluded_types = {
+                "bakery", "cafe", "bar", "meal_takeaway", "meal_delivery",
+                "convenience_store", "grocery_or_supermarket", "supermarket",
+                "food", "store", "point_of_interest"  # too generic
+            }
+            
+            # Types that MUST be present (actual restaurants)
+            required_types = {"restaurant"}
+            
             competitors = []
             for place in result.get("results", [])[:max_results]:
                 geometry = place.get("geometry", {})
                 location_data = geometry.get("location", {})
+                place_types = set(place.get("types", []))
+                place_name = place.get("name", "").lower()
+                
+                # STRICT FILTERING: Must be a restaurant type
+                if not place_types & required_types:
+                    logger.debug(f"[GOOGLE MAPS] Excluded '{place.get('name')}' - not a restaurant type: {place_types}")
+                    continue
+                
+                # Exclude bakeries, beverage shops, etc. by name
+                excluded_keywords = ["bakery", "bread", "lassi", "chai", "tea", "coffee", "juice", "sweets", "mithai"]
+                if any(keyword in place_name for keyword in excluded_keywords):
+                    logger.debug(f"[GOOGLE MAPS] Excluded '{place.get('name')}' - matches excluded keyword")
+                    continue
                 
                 competitors.append(
                     PlaceSearchResult(
@@ -177,7 +200,7 @@ class GoogleMapsTools:
                     )
                 )
 
-            logger.info(f"[GOOGLE MAPS] Found {len(competitors)} competitors")
+            logger.info(f"[GOOGLE MAPS] Found {len(competitors)} competitors (after filtering)")
             return competitors
         except Exception as e:
             logger.error(f"[GOOGLE MAPS] Error finding competitors: {e}")
@@ -318,6 +341,7 @@ class GoogleMapsTools:
                     review_count=place.user_ratings_total,
                     price_level=self._price_level_to_string(place.price_level),
                     cuisine_type=inferred_cuisine,
+                    cuisine_subtype=inferred_cuisine,
                     website=website,
                     place_id=place.place_id,
                 )

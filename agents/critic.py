@@ -349,9 +349,12 @@ Output your evaluation as JSON using the required schema."""
         researcher_output = state.get("researcher_output")
         if not researcher_output:
             raise ValueError("No researcher_output found in state")
+            
+        user_query = state.get("user_query", "")
+        planner_output = state.get("planner_output", {})
 
         try:
-            output = self.evaluate(researcher_output)  # researcher_output is already a dict
+            output = self.evaluate(user_query, planner_output, researcher_output)
 
             if output.decision == "ACCEPT":
                 next_node = "report"

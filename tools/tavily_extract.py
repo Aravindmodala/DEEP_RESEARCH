@@ -230,7 +230,7 @@ Content:
             "error": None if result.success else result.error,
             # Keep content but cap size to avoid blowing up state/LLM context
             "content_length": len(result.raw_content or ""),
-            "raw_content": (result.raw_content or "")[:12000],
+            "raw_content": (result.raw_content or "")[:50000],  # Increased to capture full menus
             "extracted_at": datetime.now().isoformat(),
         }
 

@@ -48,6 +48,21 @@ class PlannerOutput(BaseModel):
 # =============================================================================
 
 
+# =============================================================================
+# RESEARCHER OUTPUT
+# =============================================================================
+
+
+class BusinessBackground(BaseModel):
+    """Business history and expansion details."""
+    
+    founding_year: str | None = None
+    founders: list[str] = Field(default_factory=list)
+    history_summary: str = ""
+    expansion_strategy: str = ""
+    recent_openings: list[str] = Field(default_factory=list)
+
+
 class RestaurantInfo(BaseModel):
     """Basic restaurant information."""
 
@@ -59,6 +74,7 @@ class RestaurantInfo(BaseModel):
     price_level: str | None = None
     cuisine_type: str = "restaurant"
     website: str | None = None
+    business_background: BusinessBackground = Field(default_factory=BusinessBackground)
 
 
 class CompetitorInfo(BaseModel):
@@ -71,16 +87,54 @@ class CompetitorInfo(BaseModel):
     review_count: int | None = None
     price_level: str | None = None
     cuisine_type: str = "restaurant"
+    cuisine_subtype: str | None = None  # e.g. "South Indian" vs "Indian"
     website: str | None = None
     place_id: str | None = None
 
 
-class MenuComparison(BaseModel):
-    """Menu comparison data."""
+# =============================================================================
+# MENU PARSING SCHEMAS (NEW)
+# =============================================================================
 
-    target_menu: dict[str, Any] | None = None
-    competitor_menus: list[dict[str, Any]] = Field(default_factory=list)
+
+class MenuItem(BaseModel):
+    """A single menu item with name, price, and category."""
+    
+    name: str = ""
+    price: float | None = None
+    category: str = "Other"
+    description: str = ""
+
+
+class ParsedMenu(BaseModel):
+    """Structured menu for a restaurant."""
+    
+    restaurant_name: str = ""
+    source_url: str = ""
+    items: list[MenuItem] = Field(default_factory=list)
+    total_items: int = 0
+    categories: list[str] = Field(default_factory=list)
+
+
+class MenuItemComparison(BaseModel):
+    """Comparison of a single item across restaurants."""
+    
+    item_name: str = ""
+    category: str = ""
+    target_price: float | None = None
+    competitor_prices: dict[str, float | None] = Field(default_factory=dict)  # {competitor_name: price}
+    price_difference_avg: float | None = None  # vs avg competitor price
+    notes: str = ""
+
+
+class MenuComparison(BaseModel):
+    """Menu comparison data with structured items."""
+
+    target_menu: ParsedMenu | None = None
+    competitor_menus: list[ParsedMenu] = Field(default_factory=list)
+    item_comparisons: list[MenuItemComparison] = Field(default_factory=list)
     unique_offerings: list[str] = Field(default_factory=list)
+    pricing_summary: str = ""
 
 
 class PricingAnalysis(BaseModel):
@@ -92,11 +146,27 @@ class PricingAnalysis(BaseModel):
     competitor_price_range: dict[str, Any] = Field(default_factory=dict)
 
 
+class SentimentQuality(BaseModel):
+    """Detailed sentiment for a specific aspect (Service, Food, etc)."""
+    
+    score: float = 0.5  # 0.0 to 1.0
+    positive_themes: list[str] = Field(default_factory=list)
+    negative_themes: list[str] = Field(default_factory=list)
+    summary: str = ""
+
+
 class RestaurantSentiment(BaseModel):
     """Sentiment analysis for a single restaurant."""
 
     name: str = ""
     sentiment_score: float = 0.5
+    
+    # Detailed aspects
+    service_quality: SentimentQuality = Field(default_factory=SentimentQuality)
+    food_quality: SentimentQuality = Field(default_factory=SentimentQuality)
+    atmosphere: SentimentQuality = Field(default_factory=SentimentQuality)
+    value_perception: SentimentQuality = Field(default_factory=SentimentQuality)
+    
     key_strengths: list[str] = Field(default_factory=list)
     key_concerns: list[str] = Field(default_factory=list)
     summary: str = ""

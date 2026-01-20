@@ -7,7 +7,8 @@ import os
 import re
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
 from loguru import logger
 from rich.console import Console
 from rich.panel import Panel
@@ -23,11 +24,56 @@ from utils import create_llm
 console = Console()
 
 
+def create_planner_tavily_tool(api_key: str | None = None):
+    """Create a Tavily search tool for the planner agent."""
+    tavily_key = api_key or os.getenv("TAVILY_API_KEY")
+    if not tavily_key:
+        raise ValueError("TAVILY_API_KEY not found")
+    
+    client = TavilyClient(api_key=tavily_key)
+    
+    @tool
+    def web_search(query: str) -> str:
+        """
+        Search the web to find information about a restaurant's cuisine type.
+        Use this to identify the exact cuisine type of a restaurant.
+        
+        Args:
+            query: Search query - include restaurant name, location, and 'cuisine type'
+        
+        Returns:
+            Search results with relevant information about the restaurant
+        """
+        try:
+            response = client.search(
+                query=query,
+                search_depth="basic",
+                max_results=5,
+                include_domains=["yelp.com", "tripadvisor.com", "google.com", "zomato.com", "grubhub.com", "doordash.com"]
+            )
+            
+            results = response.get("results", [])
+            if not results:
+                return "No search results found."
+            
+            output = []
+            for r in results[:5]:
+                output.append(f"Title: {r.get('title', 'Unknown')}\nContent: {r.get('content', '')[:500]}\n")
+            
+            return "\n---\n".join(output)
+        except Exception as e:
+            logger.error(f"[PLANNER] Tavily search error: {e}")
+            return f"Search failed: {str(e)}"
+    
+    return web_search
+
+
 class PlannerAgent:
     """
     NODE 1 — PLANNER AGENT
     
     Converts user's natural-language request into a research plan.
+    Uses Tavily search tool to identify cuisine type.
     Returns a validated PlannerOutput Pydantic model.
     """
 
@@ -35,17 +81,25 @@ class PlannerAgent:
         self.config = config
         self.llm = create_llm(config)
         
-        # Initialize Tavily client for cuisine detection
+        # Initialize Tavily client and tool for cuisine detection
         tavily_key = config.tavily_api_key or os.getenv("TAVILY_API_KEY")
         if tavily_key:
             self.tavily = TavilyClient(api_key=tavily_key)
+            self.tavily_tool = create_planner_tavily_tool(tavily_key)
+            self.tools = [self.tavily_tool]
+            # Bind tools to LLM for tool calling
+            self.llm_with_tools = self.llm.bind_tools(self.tools)
         else:
             self.tavily = None
+            self.tavily_tool = None
+            self.tools = []
+            self.llm_with_tools = self.llm
             logger.warning("[PLANNER] Tavily API key not found - cuisine detection may be limited")
 
     def plan(self, user_query: str) -> PlannerOutput:
         """
         Convert a user query into a research plan.
+        Uses Tavily search tool to identify cuisine type.
         
         Returns validated PlannerOutput Pydantic model.
         """
@@ -56,8 +110,56 @@ class PlannerAgent:
             HumanMessage(content=f"User Query: {user_query}"),
         ]
 
-        response = self.llm.invoke(messages)
-        plan_dict = self._extract_json(response.content)
+        # Tool calling loop - allow LLM to use web_search for cuisine detection
+        max_iterations = 3
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Use LLM with tools bound
+            if self.tools:
+                response = self.llm_with_tools.invoke(messages)
+            else:
+                response = self.llm.invoke(messages)
+            
+            # Check if response has tool calls
+            if hasattr(response, 'tool_calls') and response.tool_calls:
+                logger.info(f"[PLANNER] LLM requested {len(response.tool_calls)} tool call(s)")
+                
+                # Add AI message with tool calls to history
+                messages.append(response)
+                
+                # Execute each tool call
+                for tool_call in response.tool_calls:
+                    tool_name = tool_call.get("name", "")
+                    tool_args = tool_call.get("args", {})
+                    tool_id = tool_call.get("id", "")
+                    
+                    logger.info(f"[PLANNER] Executing tool: {tool_name} with args: {tool_args}")
+                    
+                    if tool_name == "web_search" and self.tavily_tool:
+                        try:
+                            result = self.tavily_tool.invoke(tool_args)
+                            logger.info(f"[PLANNER] Tool result received ({len(str(result))} chars)")
+                        except Exception as e:
+                            result = f"Tool execution failed: {str(e)}"
+                            logger.error(f"[PLANNER] Tool error: {e}")
+                    else:
+                        result = f"Unknown tool: {tool_name}"
+                    
+                    # Add tool result to messages
+                    messages.append(ToolMessage(content=str(result), tool_call_id=tool_id))
+                
+                # Continue loop to get final response
+                continue
+            
+            # No tool calls - extract JSON from response
+            break
+        
+        # Extract JSON from final response
+        response_content = response.content if hasattr(response, 'content') else str(response)
+        plan_dict = self._extract_json(response_content)
 
         if not plan_dict:
             logger.error("[PLANNER] Failed to extract JSON from response")
@@ -65,39 +167,41 @@ class PlannerAgent:
             plan_dict = {
                 "target_restaurant": "Unknown",
                 "location": "Unknown",
+                "cuisine_type": "unknown",
                 "intent": user_query,
                 "search_queries": [user_query],
             }
 
         # Validate and return as Pydantic model
         output = PlannerOutput(**plan_dict)
-        logger.info(f"[PLANNER] Plan created for {output.target_restaurant}")
+        logger.info(f"[PLANNER] Plan created for {output.target_restaurant} (cuisine: {output.cuisine_type})")
         return output
 
     def plan_with_confirmation(self, user_query: str) -> PlannerOutput:
         """Generate a research plan with human confirmation."""
         console.print("\n[bold cyan]Analyzing your request...[/bold cyan]\n")
         
-        # Generate initial plan (returns PlannerOutput)
+        # Generate initial plan with cuisine detection via tool calling
+        console.print("[dim]Detecting cuisine type via web search...[/dim]")
         plan_output = self.plan(user_query)
         
         # Convert to dict for interactive editing
         plan = plan_output.model_dump()
         
-        # Detect cuisine type via web search
-        console.print("[dim]Detecting cuisine type from web sources...[/dim]")
-        cuisine = self._detect_cuisine_from_web(
-            plan.get("target_restaurant", ""),
-            plan.get("location", "")
-        )
-        plan["cuisine_type"] = cuisine
-        
-        # Update first search query with cuisine type
-        if cuisine and cuisine.lower() != "unknown":
-            queries = plan.get("search_queries", [])
-            if queries:
-                queries[0] = f"{cuisine} restaurants competitors near {plan.get('location', '')}"
-                plan["search_queries"] = queries
+        # If cuisine type is still unknown, try fallback detection
+        if plan.get("cuisine_type", "unknown").lower() == "unknown":
+            console.print("[dim]Attempting fallback cuisine detection...[/dim]")
+            cuisine = self._detect_cuisine_from_web(
+                plan.get("target_restaurant", ""),
+                plan.get("location", "")
+            )
+            if cuisine and cuisine.lower() != "unknown":
+                plan["cuisine_type"] = cuisine
+                # Update first search query with cuisine type
+                queries = plan.get("search_queries", [])
+                if queries:
+                    queries[0] = f"{cuisine} restaurants competitors near {plan.get('location', '')}"
+                    plan["search_queries"] = queries
         
         # Confirmation loop
         while True:
@@ -143,12 +247,13 @@ class PlannerAgent:
                 for r in results[:5]
             ])
             
-            extraction_prompt = f"""Based on the following web search results, identify the cuisine type of "{restaurant}" in {location}.
+            extraction_prompt = f"""Based on the following web search results, identify the EXACT CUISINE SUBTYPE of "{restaurant}" in {location}.
 
 SEARCH RESULTS:
 {search_context}
 
-Respond with ONLY the cuisine type (e.g., "Indian", "Italian", "Mexican", "unknown").
+Respond with ONLY the specific cuisine type (e.g., "South Indian" instead of just "Indian", "Tuscan" instead of "Italian").
+If specific subtype is not clear, use the primary cuisine.
 Do not include any explanation."""
 
             response = self.llm.invoke([HumanMessage(content=extraction_prompt)])
