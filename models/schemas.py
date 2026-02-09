@@ -30,7 +30,7 @@ class SourceReference(BaseModel):
 class PlannerOutput(BaseModel):
     """
     Structured output from the Planner Agent.
-    
+
     Converts user's natural-language request into a research plan.
     """
 
@@ -44,23 +44,24 @@ class PlannerOutput(BaseModel):
 
 
 # =============================================================================
-# RESEARCHER OUTPUT
-# =============================================================================
-
-
-# =============================================================================
-# RESEARCHER OUTPUT
+# RESEARCHER OUTPUT (Raw Data Only)
 # =============================================================================
 
 
 class BusinessBackground(BaseModel):
     """Business history and expansion details."""
-    
+
     founding_year: str | None = None
     founders: list[str] = Field(default_factory=list)
     history_summary: str = ""
     expansion_strategy: str = ""
     recent_openings: list[str] = Field(default_factory=list)
+    corporate_structure: str = ""
+    sister_brands: list[str] = Field(default_factory=list)
+    total_locations: int | None = None
+    awards: list[str] = Field(default_factory=list)
+    community_partnerships: list[str] = Field(default_factory=list)
+    leadership_team: list[str] = Field(default_factory=list)
 
 
 class RestaurantInfo(BaseModel):
@@ -74,6 +75,8 @@ class RestaurantInfo(BaseModel):
     price_level: str | None = None
     cuisine_type: str = "restaurant"
     website: str | None = None
+    editorial_summary: str = ""
+    types: list[str] = Field(default_factory=list)
     business_background: BusinessBackground = Field(default_factory=BusinessBackground)
 
 
@@ -87,19 +90,19 @@ class CompetitorInfo(BaseModel):
     review_count: int | None = None
     price_level: str | None = None
     cuisine_type: str = "restaurant"
-    cuisine_subtype: str | None = None  # e.g. "South Indian" vs "Indian"
+    cuisine_subtype: str | None = None
     website: str | None = None
     place_id: str | None = None
 
 
 # =============================================================================
-# MENU PARSING SCHEMAS (NEW)
+# MENU PARSING SCHEMAS
 # =============================================================================
 
 
 class MenuItem(BaseModel):
     """A single menu item with name, price, and category."""
-    
+
     name: str = ""
     price: float | None = None
     category: str = "Other"
@@ -108,7 +111,7 @@ class MenuItem(BaseModel):
 
 class ParsedMenu(BaseModel):
     """Structured menu for a restaurant."""
-    
+
     restaurant_name: str = ""
     source_url: str = ""
     items: list[MenuItem] = Field(default_factory=list)
@@ -118,12 +121,12 @@ class ParsedMenu(BaseModel):
 
 class MenuItemComparison(BaseModel):
     """Comparison of a single item across restaurants."""
-    
+
     item_name: str = ""
     category: str = ""
     target_price: float | None = None
-    competitor_prices: dict[str, float | None] = Field(default_factory=dict)  # {competitor_name: price}
-    price_difference_avg: float | None = None  # vs avg competitor price
+    competitor_prices: dict[str, float | None] = Field(default_factory=dict)
+    price_difference_avg: float | None = None
     notes: str = ""
 
 
@@ -148,8 +151,8 @@ class PricingAnalysis(BaseModel):
 
 class SentimentQuality(BaseModel):
     """Detailed sentiment for a specific aspect (Service, Food, etc)."""
-    
-    score: float = 0.5  # 0.0 to 1.0
+
+    score: float = 0.5
     positive_themes: list[str] = Field(default_factory=list)
     negative_themes: list[str] = Field(default_factory=list)
     summary: str = ""
@@ -159,16 +162,20 @@ class RestaurantSentiment(BaseModel):
     """Sentiment analysis for a single restaurant."""
 
     name: str = ""
+    address: str = ""
+    rating: float | None = None
+    review_count: int | None = None
     sentiment_score: float = 0.5
-    
-    # Detailed aspects
+
     service_quality: SentimentQuality = Field(default_factory=SentimentQuality)
     food_quality: SentimentQuality = Field(default_factory=SentimentQuality)
     atmosphere: SentimentQuality = Field(default_factory=SentimentQuality)
     value_perception: SentimentQuality = Field(default_factory=SentimentQuality)
-    
+
     key_strengths: list[str] = Field(default_factory=list)
     key_concerns: list[str] = Field(default_factory=list)
+    customer_satisfaction: str = ""
+    suggestions: list[str] = Field(default_factory=list)
     summary: str = ""
 
 
@@ -194,18 +201,99 @@ class MarketSignals(BaseModel):
 class ResearcherOutput(BaseModel):
     """
     Structured output from the Researcher Agent.
-    
-    Contains all research findings from the autonomous ReAct loop.
+
+    Raw data only - analysis moved to Analyst Agent.
     """
 
     target: RestaurantInfo | None = None
     competitors: list[CompetitorInfo] = Field(default_factory=list)
-    menu_comparison: MenuComparison = Field(default_factory=MenuComparison)
-    pricing_analysis: PricingAnalysis = Field(default_factory=PricingAnalysis)
-    sentiment_analysis: SentimentAnalysis = Field(default_factory=SentimentAnalysis)
-    market_signals: MarketSignals = Field(default_factory=MarketSignals)
+    raw_reviews: dict[str, Any] = Field(default_factory=dict)
+    supplementary_reviews: dict[str, Any] = Field(default_factory=dict)
+    raw_menus: list[dict[str, Any]] = Field(default_factory=list)
+    business_intel: dict[str, Any] = Field(default_factory=dict)
+    market_data: list[dict[str, Any]] = Field(default_factory=list)
     raw_sources: list[SourceReference] = Field(default_factory=list)
     research_notes: list[str] = Field(default_factory=list)
+
+
+# =============================================================================
+# ANALYST OUTPUT (NEW)
+# =============================================================================
+
+
+class SWOTAnalysis(BaseModel):
+    """SWOT analysis for a single restaurant."""
+
+    restaurant_name: str = ""
+    strengths: list[str] = Field(default_factory=list)
+    weaknesses: list[str] = Field(default_factory=list)
+    opportunities: list[str] = Field(default_factory=list)
+    threats: list[str] = Field(default_factory=list)
+    overall_impression: str = ""
+
+
+class CompetitivePositioning(BaseModel):
+    """Competitive positioning analysis."""
+
+    target_position: str = ""
+    competitor_positions: dict[str, str] = Field(default_factory=dict)
+    differentiation_factors: list[str] = Field(default_factory=list)
+    vulnerability_factors: list[str] = Field(default_factory=list)
+
+
+class ReviewKeywordAnalysis(BaseModel):
+    """Keyword frequency analysis from reviews."""
+
+    positive_keywords: dict[str, int] = Field(default_factory=dict)
+    negative_keywords: dict[str, int] = Field(default_factory=dict)
+    service_mentions: dict[str, int] = Field(default_factory=dict)
+    food_mentions: dict[str, int] = Field(default_factory=dict)
+    atmosphere_mentions: dict[str, int] = Field(default_factory=dict)
+    value_mentions: dict[str, int] = Field(default_factory=dict)
+    top_complaints: list[str] = Field(default_factory=list)
+    top_praises: list[str] = Field(default_factory=list)
+
+
+class PerformanceMetrics(BaseModel):
+    """Performance metrics for a restaurant."""
+
+    restaurant_name: str = ""
+    avg_rating: float | None = None
+    review_volume: int | None = None
+    sentiment_score: float | None = None
+    competitive_rank: int | None = None
+    price_competitiveness: str = ""
+
+
+class StrategicPillar(BaseModel):
+    """A single strategic recommendation pillar."""
+
+    pillar_name: str = ""
+    description: str = ""
+    kpi_targets: list[str] = Field(default_factory=list)
+    quarterly_milestones: list[str] = Field(default_factory=list)
+
+
+class StrategicRecommendations(BaseModel):
+    """Strategic recommendations with pillars and categories."""
+
+    pillars: list[StrategicPillar] = Field(default_factory=list)
+    immediate_actions: list[str] = Field(default_factory=list)
+    short_term_goals: list[str] = Field(default_factory=list)
+    long_term_vision: str = ""
+
+
+class AnalystOutput(BaseModel):
+    """Aggregated output from the Analyst Agent's 7 analysis passes."""
+
+    swot_analyses: list[SWOTAnalysis] = Field(default_factory=list)
+    sentiment_analysis: SentimentAnalysis = Field(default_factory=SentimentAnalysis)
+    parsed_menus: list[ParsedMenu] = Field(default_factory=list)
+    menu_comparison: MenuComparison = Field(default_factory=MenuComparison)
+    keyword_analysis: ReviewKeywordAnalysis = Field(default_factory=ReviewKeywordAnalysis)
+    performance_metrics: list[PerformanceMetrics] = Field(default_factory=list)
+    strategic_recommendations: StrategicRecommendations = Field(default_factory=StrategicRecommendations)
+    competitive_positioning: CompetitivePositioning = Field(default_factory=CompetitivePositioning)
 
 
 # =============================================================================
@@ -225,7 +313,7 @@ class ResearchIssue(BaseModel):
 class CriticOutput(BaseModel):
     """
     Structured output from the Critic Agent.
-    
+
     Evaluates research quality and determines ACCEPT/REJECT decision.
     """
 
@@ -273,9 +361,6 @@ class CompetitiveLandscapeSection(BaseModel):
     competitor_count: int = 0
     market_saturation_level: str = "unknown"
 
-    # NOTE: We must avoid `dict[str, Any]` here because OpenAI structured output
-    # requires JSON schemas with `additionalProperties: false` for object items.
-    # Using a concrete Pydantic model with `extra="forbid"` produces a valid schema.
     top_competitors: list[TopCompetitor] = Field(default_factory=list)
     competitive_advantages: list[str] = Field(default_factory=list)
     competitive_disadvantages: list[str] = Field(default_factory=list)
@@ -325,7 +410,7 @@ class FinalRecommendation(BaseModel):
 class ReportOutput(BaseModel):
     """
     Final structured report from the Report Agent.
-    
+
     This model is rendered into a document/UI and needs guaranteed structure.
     """
 

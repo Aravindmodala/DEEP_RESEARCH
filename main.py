@@ -23,6 +23,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Fix Windows console encoding for Unicode output
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    os.environ.setdefault("PYTHONUTF8", "1")
+
 from dotenv import load_dotenv
 from loguru import logger
 from rich.console import Console
@@ -96,14 +102,15 @@ def validate_environment() -> bool:
     return True
 
 
-def run_research(query: str, output_file: str | None = None) -> dict:
+def run_research(query: str, output_file: str | None = None, skip_confirmation: bool = False) -> dict:
     """
     Run the deep research pipeline.
-    
+
     Args:
         query: Natural language research query
         output_file: Optional path to save the report
-        
+        skip_confirmation: If True, skip interactive plan confirmation
+
     Returns:
         Final state with all agent outputs
     """
@@ -117,7 +124,7 @@ def run_research(query: str, output_file: str | None = None) -> dict:
 
     # Initialize orchestrator
     config = get_config()
-    orchestrator = DeepResearchOrchestrator(config)
+    orchestrator = DeepResearchOrchestrator(config, skip_confirmation=skip_confirmation)
 
     # Run with progress indication
     with Progress(
@@ -159,12 +166,12 @@ def run_research(query: str, output_file: str | None = None) -> dict:
             output_path = Path(output_file)
             
             # Save markdown
-            output_path.with_suffix(".md").write_text(md_report)
+            output_path.with_suffix(".md").write_text(md_report, encoding="utf-8")
             console.print(f"\n[green]Report saved to:[/green] {output_path.with_suffix('.md')}")
-            
+
             # Save JSON
             json_path = output_path.with_suffix(".json")
-            with open(json_path, "w") as f:
+            with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, indent=2, default=str)
             console.print(f"[green]Full data saved to:[/green] {json_path}")
 
@@ -202,7 +209,7 @@ def interactive_mode() -> None:
                 if last_result and last_result.get("report_output"):
                     filename = query[5:].strip()
                     md_report = format_report_as_markdown(last_result["report_output"])
-                    Path(filename).with_suffix(".md").write_text(md_report)
+                    Path(filename).with_suffix(".md").write_text(md_report, encoding="utf-8")
                     console.print(f"[green]Saved to {filename}.md[/green]")
                 else:
                     console.print("[yellow]No report to save. Run a query first.[/yellow]")
@@ -274,6 +281,11 @@ Examples:
         action="store_true",
         help="Disable logging to file",
     )
+    parser.add_argument(
+        "--no-confirm",
+        action="store_true",
+        help="Skip interactive plan confirmation (auto-accept)",
+    )
 
     args = parser.parse_args()
 
@@ -288,7 +300,7 @@ Examples:
     if args.interactive:
         interactive_mode()
     elif args.query:
-        run_research(args.query, args.output)
+        run_research(args.query, args.output, skip_confirmation=args.no_confirm)
     else:
         # No query provided - prompt for input
         console.print(

@@ -7,7 +7,7 @@ from typing import Any, TypedDict
 
 class AgentGraphState(TypedDict, total=False):
     """State schema for the agent graph.
-    
+
     This TypedDict defines the shared state that flows between
     all nodes in the LangGraph workflow.
     """
@@ -18,6 +18,7 @@ class AgentGraphState(TypedDict, total=False):
     # Node outputs (as dicts for serialization)
     planner_output: dict[str, Any] | None
     researcher_output: dict[str, Any] | None
+    analyst_output: dict[str, Any] | None
     critic_output: dict[str, Any] | None
     report_output: dict[str, Any] | None
 
@@ -31,4 +32,3 @@ class AgentGraphState(TypedDict, total=False):
     session_id: str
     started_at: str
     completed_at: str | None
-

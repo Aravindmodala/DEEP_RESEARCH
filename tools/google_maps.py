@@ -226,6 +226,8 @@ class GoogleMapsTools:
                     "opening_hours",
                     "reviews",
                     "url",
+                    "editorial_summary",
+                    "type",
                 ],
             )
             return result.get("result", {})
@@ -433,4 +435,22 @@ def create_google_maps_tools(api_key: str | None = None) -> list:
         details = maps.get_place_details(place_id)
         return str(details)
 
-    return [find_restaurant, find_competitors, get_restaurant_reviews, get_restaurant_details]
+    @tool
+    def get_restaurant_website(place_id: str) -> str:
+        """
+        Get the official website URL for a restaurant using its Google Place ID.
+
+        Args:
+            place_id: Google Place ID of the restaurant
+        """
+        try:
+            details = maps.get_place_details(place_id)
+            website = details.get("website", "")
+            name = details.get("name", "Unknown")
+            if website:
+                return f"Website for {name}: {website}"
+            return f"No website found for {name} (place_id: {place_id})"
+        except Exception as e:
+            return f"Error getting website: {str(e)}"
+
+    return [find_restaurant, find_competitors, get_restaurant_reviews, get_restaurant_details, get_restaurant_website]

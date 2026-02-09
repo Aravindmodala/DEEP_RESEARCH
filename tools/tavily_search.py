@@ -279,6 +279,63 @@ def create_tavily_tools(api_key: str | None = None) -> list:
         )
         return context
 
-    return [web_search, search_restaurant_market, search_foot_traffic, get_market_context]
+    @tool
+    def search_reviews(restaurant_name: str, location: str) -> str:
+        """
+        Search for restaurant reviews on Yelp, TripAdvisor, and Google.
+        Use this to supplement Google Maps reviews with additional review sources.
+
+        Args:
+            restaurant_name: Name of the restaurant
+            location: City, State location
+        """
+        results = tavily.search(
+            query=f"{restaurant_name} {location} restaurant reviews",
+            search_depth="advanced",
+            max_results=10,
+            include_domains=["yelp.com", "tripadvisor.com", "google.com"],
+        )
+        output = [
+            {
+                "title": r.title,
+                "url": r.url,
+                "content": r.content[:800],
+                "relevance": r.score,
+            }
+            for r in results
+        ]
+        return str(output)
+
+    @tool
+    def search_menu(restaurant_name: str, location: str) -> str:
+        """
+        Search for restaurant menu URLs on delivery platforms and menu sites.
+        Searches DoorDash, UberEats, Grubhub, Allmenus, and official websites.
+
+        Args:
+            restaurant_name: Name of the restaurant
+            location: City, State location
+        """
+        results = tavily.search(
+            query=f"{restaurant_name} {location} menu prices",
+            search_depth="advanced",
+            max_results=10,
+            include_domains=[
+                "doordash.com", "ubereats.com", "grubhub.com",
+                "allmenus.com", "menupages.com",
+            ],
+        )
+        output = [
+            {
+                "title": r.title,
+                "url": r.url,
+                "content": r.content[:500],
+                "relevance": r.score,
+            }
+            for r in results
+        ]
+        return str(output)
+
+    return [web_search, search_restaurant_market, search_foot_traffic, get_market_context, search_reviews, search_menu]
 
 

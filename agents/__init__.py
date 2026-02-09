@@ -2,9 +2,8 @@
 
 from .planner import PlannerAgent
 from .researcher import ResearcherAgent
+from .analyst import AnalystAgent
 from .critic import CriticAgent
 from .report import ReportAgent
 
-__all__ = ["PlannerAgent", "ResearcherAgent", "CriticAgent", "ReportAgent"]
-
-
+__all__ = ["PlannerAgent", "ResearcherAgent", "AnalystAgent", "CriticAgent", "ReportAgent"]

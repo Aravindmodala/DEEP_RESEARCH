@@ -9,6 +9,24 @@ from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
+# Default report sections (all 13)
+DEFAULT_REPORT_SECTIONS = [
+    "executive_summary",
+    "history_founding",
+    "dining_concept_menu",
+    "allergy_dietary",
+    "expansion_locations",
+    "leadership_ownership",
+    "community_engagement",
+    "awards_recognition",
+    "comparison_analysis",
+    "sentiment_analysis",
+    "menu_comparison",
+    "operational_analysis",
+    "performance_strategy",
+]
+
+
 class AgentConfig(BaseSettings):
     """Configuration for all agent nodes."""
 
@@ -31,19 +49,19 @@ class AgentConfig(BaseSettings):
     # =========================================================================
     # Provider API Keys
     # =========================================================================
-    
+
     # OpenAI
     openai_api_key: str | None = Field(
         default=None,
         alias="OPENAI_API_KEY",
     )
-    
+
     # Anthropic
     anthropic_api_key: str | None = Field(
         default=None,
         alias="ANTHROPIC_API_KEY",
     )
-    
+
     # Google Vertex AI / Gemini
     gcp_project_id: str | None = Field(
         default=None,
@@ -55,7 +73,7 @@ class AgentConfig(BaseSettings):
         alias="GCP_LOCATION",
         description="Google Cloud region for Vertex AI",
     )
-    
+
     # Ollama (Local)
     ollama_base_url: str = Field(
         default="http://localhost:11434",
@@ -93,6 +111,34 @@ class AgentConfig(BaseSettings):
     max_menu_items_per_restaurant: int = Field(
         default=50,
         description="Maximum menu items to extract per restaurant",
+    )
+
+    # =========================================================================
+    # Phase-Gated Researcher Settings
+    # =========================================================================
+    max_react_iterations_per_phase: int = Field(
+        default=8,
+        description="Maximum ReAct iterations per research phase",
+    )
+    max_total_react_iterations: int = Field(
+        default=35,
+        description="Hard cap on total ReAct iterations across all phases",
+    )
+
+    # =========================================================================
+    # Analyst Settings
+    # =========================================================================
+    analyst_max_llm_calls: int = Field(
+        default=15,
+        description="Maximum LLM calls for the Analyst agent",
+    )
+
+    # =========================================================================
+    # Report Settings
+    # =========================================================================
+    report_sections_enabled: list[str] = Field(
+        default_factory=lambda: DEFAULT_REPORT_SECTIONS.copy(),
+        description="List of report section keys to generate",
     )
 
     # =========================================================================

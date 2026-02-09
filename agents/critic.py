@@ -17,9 +17,10 @@ from utils import create_llm
 
 class CriticAgent:
     """
-    NODE 3 — CRITIC AGENT
-    
-    Evaluates research quality using rule-based checks + LLM evaluation.
+    NODE 4 — CRITIC AGENT
+
+    Evaluates research + analysis quality using rule-based checks + LLM evaluation.
+    Now also evaluates the Analyst output for depth of analysis.
     Returns validated CriticOutput Pydantic model.
     """
 
@@ -32,37 +33,37 @@ class CriticAgent:
         user_query: str,
         plan: dict[str, Any],
         research: dict[str, Any],
+        analyst: dict[str, Any] | None = None,
     ) -> CriticOutput:
         """
-        Evaluate research quality and decide ACCEPT or REJECT.
-        
+        Evaluate research + analysis quality and decide ACCEPT or REJECT.
+
         Args:
             user_query: Original user request
             plan: Planner output dict
             research: Research output dict from Researcher
-            
+            analyst: Analyst output dict (optional, may be None on first pass)
+
         Returns:
             Validated CriticOutput Pydantic model
         """
-        logger.info("[CRITIC] Evaluating research quality...")
+        logger.info("[CRITIC] Evaluating research and analysis quality...")
 
-        # LLM evaluation (keep the prompt compact; do not dump entire state)
+        # LLM evaluation
         messages = [
             SystemMessage(content=CRITIC_SYSTEM_PROMPT),
-            HumanMessage(content=self._format_research_for_review(user_query, plan, research)),
+            HumanMessage(content=self._format_research_for_review(user_query, plan, research, analyst)),
         ]
 
         response = self.llm.invoke(messages)
         llm_evaluation = self._parse_llm_evaluation(response.content)
 
-        # Use only LLM issues (less strict, avoids false negatives from deterministic rules)
         all_issues = llm_evaluation.get("issues", [])
 
         # Calculate quality score
-        quality_score = self._calculate_quality_score(research, all_issues)
+        quality_score = self._calculate_quality_score(research, analyst, all_issues)
 
-        # Determine decision (less strict)
-        # Only REJECT if core research is missing (hard blocker)
+        # Determine decision
         competitors = research.get("competitors", []) if isinstance(research, dict) else []
         target = research.get("target") if isinstance(research, dict) else None
         core_ok = bool(target) and isinstance(competitors, list) and len(competitors) >= 3
@@ -75,7 +76,7 @@ class CriticAgent:
             ]
 
         # Identify strengths
-        strengths = self._identify_strengths(research)
+        strengths = self._identify_strengths(research, analyst)
 
         # Banking suitability assessment
         banking_assessment = self._assess_banking_suitability(research, all_issues)
@@ -84,7 +85,6 @@ class CriticAgent:
         issues_models = []
         for issue in all_issues:
             severity = issue.get("severity", "minor")
-            # Ensure severity is valid
             if severity not in ("critical", "major", "minor"):
                 severity = "minor"
             issues_models.append(ResearchIssue(
@@ -109,84 +109,70 @@ class CriticAgent:
 
         return output
 
-    def _compact_research_for_review(self, research: dict[str, Any]) -> dict[str, Any]:
-        """Create a compact representation of research for Critic prompting."""
+    def _compact_research_for_review(self, research: dict[str, Any], analyst: dict[str, Any] | None) -> dict[str, Any]:
+        """Create a compact representation of research + analysis for Critic prompting."""
         competitors = research.get("competitors", []) if isinstance(research, dict) else []
-        menu = research.get("menu_comparison", {}) if isinstance(research, dict) else {}
-        pricing = research.get("pricing_analysis", {}) if isinstance(research, dict) else {}
-        market = research.get("market_signals", {}) if isinstance(research, dict) else {}
-        sentiment = research.get("sentiment_analysis", {}) if isinstance(research, dict) else {}
+        raw_reviews = research.get("raw_reviews", {}) if isinstance(research, dict) else {}
+        raw_menus = research.get("raw_menus", []) if isinstance(research, dict) else []
+        business_intel = research.get("business_intel", {}) if isinstance(research, dict) else {}
+        market_data = research.get("market_data", []) if isinstance(research, dict) else []
         sources = research.get("raw_sources", []) if isinstance(research, dict) else []
 
-        # Keep only a few competitors (selected set, not "found")
+        # Compact competitors
         competitors_compact = []
         if isinstance(competitors, list):
             for c in competitors[:5]:
                 if isinstance(c, dict):
-                    competitors_compact.append(
-                        {
-                            "name": c.get("name"),
-                            "distance_miles": c.get("distance_miles"),
-                            "rating": c.get("rating"),
-                            "review_count": c.get("review_count"),
-                            "price_level": c.get("price_level"),
-                            "website": c.get("website"),
-                            "place_id": c.get("place_id"),
-                        }
-                    )
+                    competitors_compact.append({
+                        "name": c.get("name"),
+                        "distance_miles": c.get("distance_miles"),
+                        "rating": c.get("rating"),
+                        "review_count": c.get("review_count"),
+                        "price_level": c.get("price_level"),
+                        "website": c.get("website"),
+                        "place_id": c.get("place_id"),
+                    })
 
-        # Summarize menu extraction without dumping raw page content
-        menu_compact: dict[str, Any] = {"target_menu_present": False, "competitor_menu_count": 0}
-        if isinstance(menu, dict):
-            target_menu = menu.get("target_menu")
-            competitor_menus = menu.get("competitor_menus", [])
-            menu_compact["target_menu_present"] = bool(target_menu)
-            if isinstance(competitor_menus, list):
-                menu_compact["competitor_menu_count"] = len(competitor_menus)
-                menu_compact["competitor_menus_sample"] = [
-                    {
-                        "restaurant_name": m.get("restaurant_name"),
-                        "source_url": m.get("source_url"),
-                        "status": m.get("status"),
-                        "content_length": m.get("content_length"),
-                    }
-                    for m in competitor_menus[:3]
-                    if isinstance(m, dict)
-                ]
+        # Compact analysis summary
+        analysis_summary = {}
+        if analyst and isinstance(analyst, dict):
+            swot = analyst.get("swot_analyses", [])
+            sentiment = analyst.get("sentiment_analysis", {})
+            parsed_menus = analyst.get("parsed_menus", [])
+            menu_comparison = analyst.get("menu_comparison", {})
+            keywords = analyst.get("keyword_analysis", {})
+            metrics = analyst.get("performance_metrics", [])
+            strategy = analyst.get("strategic_recommendations", {})
 
-        # Strip raw reviews to reduce payload
-        sentiment_compact = {}
-        if isinstance(sentiment, dict):
-            sentiment_compact = {
-                "comparative_summary": sentiment.get("comparative_summary", ""),
-                "restaurants": sentiment.get("restaurants", [])[:5] if isinstance(sentiment.get("restaurants"), list) else [],
+            analysis_summary = {
+                "swot_count": len(swot) if isinstance(swot, list) else 0,
+                "swot_has_content": any(s.get("strengths") for s in swot) if isinstance(swot, list) else False,
+                "sentiment_restaurant_count": len(sentiment.get("restaurants", [])) if isinstance(sentiment, dict) else 0,
+                "sentiment_has_dimensions": any(
+                    r.get("service_quality", {}).get("score") for r in sentiment.get("restaurants", [])
+                ) if isinstance(sentiment, dict) else False,
+                "parsed_menus_count": len(parsed_menus) if isinstance(parsed_menus, list) else 0,
+                "menu_comparison_items": len(menu_comparison.get("item_comparisons", [])) if isinstance(menu_comparison, dict) else 0,
+                "keywords_analyzed": bool(keywords.get("positive_keywords")) if isinstance(keywords, dict) else False,
+                "metrics_count": len(metrics) if isinstance(metrics, list) else 0,
+                "strategy_pillars": len(strategy.get("pillars", [])) if isinstance(strategy, dict) else 0,
             }
-
-        # Keep sources minimal
-        sources_compact = []
-        if isinstance(sources, list):
-            for s in sources[:5]:
-                if isinstance(s, dict):
-                    sources_compact.append(
-                        {
-                            "source_type": s.get("source_type"),
-                            "title": s.get("title"),
-                            "url": s.get("url"),
-                            "accessed_at": s.get("accessed_at"),
-                        }
-                    )
 
         return {
             "target": research.get("target"),
             "selected_competitors": competitors_compact,
-            "menu_summary": menu_compact,
-            "pricing_analysis": pricing,
-            "market_signals": market,
-            "sentiment_analysis": sentiment_compact,
-            "sources": sources_compact,
+            "raw_reviews_count": len(raw_reviews) if isinstance(raw_reviews, dict) else 0,
+            "raw_menus_count": len(raw_menus) if isinstance(raw_menus, list) else 0,
+            "business_intel_present": bool(business_intel),
+            "market_data_count": len(market_data) if isinstance(market_data, list) else 0,
+            "sources_count": len(sources) if isinstance(sources, list) else 0,
+            "analysis_summary": analysis_summary,
         }
 
-    def _format_research_for_review(self, user_query: str, plan: dict[str, Any], research: dict[str, Any]) -> str:
+    def _format_research_for_review(
+        self, user_query: str, plan: dict[str, Any],
+        research: dict[str, Any], analyst: dict[str, Any] | None
+    ) -> str:
         """Format a compact critique prompt for the Critic LLM."""
         plan_summary = {
             "target_restaurant": plan.get("target_restaurant"),
@@ -194,7 +180,7 @@ class CriticAgent:
             "cuisine_type": plan.get("cuisine_type"),
             "intent": plan.get("intent"),
         }
-        compact = self._compact_research_for_review(research)
+        compact = self._compact_research_for_review(research, analyst)
 
         return f"""## User Request
 {user_query}
@@ -204,14 +190,15 @@ class CriticAgent:
 {json.dumps(plan_summary, indent=2, default=str)}
 ```
 
-## Research Output (compact)
+## Research + Analysis Output (compact)
 ```json
 {json.dumps(compact, indent=2, default=str)}
 ```
 
 ## Task
-Provide a constructive critique of the research output:
+Provide a constructive critique of the research and analysis output:
 - What are the top gaps or risks?
+- Is the analysis depth sufficient (SWOT, sentiment dimensions, menu parsing, keywords)?
 - What should be improved next to strengthen the final report?
 - Point out any obvious inconsistencies (if any).
 
@@ -232,7 +219,6 @@ Output your evaluation as JSON using the required schema."""
                 else:
                     data = {}
 
-            # Parse issues from LLM response
             issues = []
             for issue_data in data.get("issues_found", []):
                 if isinstance(issue_data, dict):
@@ -249,7 +235,9 @@ Output your evaluation as JSON using the required schema."""
             logger.warning(f"[CRITIC] Error parsing LLM evaluation: {e}")
             return {"issues": [], "raw": {}}
 
-    def _calculate_quality_score(self, research: dict[str, Any], issues: list[dict]) -> float:
+    def _calculate_quality_score(
+        self, research: dict[str, Any], analyst: dict[str, Any] | None, issues: list[dict]
+    ) -> float:
         """Calculate overall quality score (0-1)."""
         score = 1.0
 
@@ -264,54 +252,85 @@ Output your evaluation as JSON using the required schema."""
 
         # Bonus for completeness
         competitors = research.get("competitors", [])
-        menu_comparison = research.get("menu_comparison")
-        sentiment_analysis = research.get("sentiment_analysis")
-        market_signals = research.get("market_signals")
+        raw_reviews = research.get("raw_reviews", {})
+        raw_menus = research.get("raw_menus", [])
         raw_sources = research.get("raw_sources", [])
 
         completeness_bonus = 0.0
         if competitors and len(competitors) >= 5:
             completeness_bonus += 0.05
-        if menu_comparison and menu_comparison.get("target_menu"):
+        if raw_reviews and len(raw_reviews) >= 2:
             completeness_bonus += 0.05
-        if sentiment_analysis and sentiment_analysis.get("restaurants"):
-            completeness_bonus += 0.05
-        if market_signals and market_signals.get("competitor_density"):
+        if raw_menus and len(raw_menus) >= 2:
             completeness_bonus += 0.05
         if len(raw_sources) >= 5:
             completeness_bonus += 0.05
 
+        # Analysis depth bonus
+        if analyst and isinstance(analyst, dict):
+            swot = analyst.get("swot_analyses", [])
+            sentiment = analyst.get("sentiment_analysis", {})
+            parsed_menus = analyst.get("parsed_menus", [])
+            keywords = analyst.get("keyword_analysis", {})
+            strategy = analyst.get("strategic_recommendations", {})
+
+            if isinstance(swot, list) and len(swot) >= 2:
+                completeness_bonus += 0.05
+            if isinstance(sentiment, dict) and len(sentiment.get("restaurants", [])) >= 2:
+                completeness_bonus += 0.05
+            if isinstance(parsed_menus, list) and len(parsed_menus) >= 2:
+                completeness_bonus += 0.05
+            if isinstance(keywords, dict) and keywords.get("positive_keywords"):
+                completeness_bonus += 0.03
+            if isinstance(strategy, dict) and len(strategy.get("pillars", [])) >= 3:
+                completeness_bonus += 0.02
+
         score += completeness_bonus
         return max(0.0, min(1.0, score))
 
-    def _identify_strengths(self, research: dict[str, Any]) -> list[str]:
-        """Identify research strengths."""
+    def _identify_strengths(self, research: dict[str, Any], analyst: dict[str, Any] | None) -> list[str]:
+        """Identify research and analysis strengths."""
         strengths = []
-        
+
         competitors = research.get("competitors", [])
-        menu_comparison = research.get("menu_comparison")
-        sentiment_analysis = research.get("sentiment_analysis")
-        market_signals = research.get("market_signals")
-        pricing_analysis = research.get("pricing_analysis")
+        raw_reviews = research.get("raw_reviews", {})
+        raw_menus = research.get("raw_menus", [])
         raw_sources = research.get("raw_sources", [])
+        business_intel = research.get("business_intel", {})
 
         if competitors and len(competitors) >= 5:
-            strengths.append(f"Comprehensive competitor analysis ({len(competitors)} competitors)")
+            strengths.append(f"Comprehensive competitor discovery ({len(competitors)} competitors)")
 
-        if menu_comparison and menu_comparison.get("target_menu"):
-            strengths.append("Target restaurant menu data extracted")
+        if raw_reviews and len(raw_reviews) >= 3:
+            strengths.append(f"Multi-source review collection ({len(raw_reviews)} restaurants)")
 
-        if sentiment_analysis and sentiment_analysis.get("restaurants"):
-            strengths.append(f"LLM-analyzed sentiment for {len(sentiment_analysis['restaurants'])} restaurants")
+        if raw_menus and len(raw_menus) >= 2:
+            strengths.append(f"Menu data collected for {len(raw_menus)} restaurants")
 
-        if market_signals and market_signals.get("market_saturation"):
-            strengths.append("Market saturation assessment provided")
-
-        if raw_sources and len(raw_sources) >= 5:
+        if raw_sources and len(raw_sources) >= 10:
             strengths.append(f"Well-sourced research ({len(raw_sources)} sources)")
 
-        if pricing_analysis and pricing_analysis.get("price_position"):
-            strengths.append(f"Clear pricing position identified: {pricing_analysis['price_position']}")
+        if business_intel:
+            strengths.append("Business intelligence gathered")
+
+        # Analysis strengths
+        if analyst and isinstance(analyst, dict):
+            swot = analyst.get("swot_analyses", [])
+            sentiment = analyst.get("sentiment_analysis", {})
+            parsed_menus = analyst.get("parsed_menus", [])
+            keywords = analyst.get("keyword_analysis", {})
+            strategy = analyst.get("strategic_recommendations", {})
+
+            if isinstance(swot, list) and len(swot) >= 2:
+                strengths.append(f"SWOT analysis for {len(swot)} restaurants")
+            if isinstance(sentiment, dict) and sentiment.get("restaurants"):
+                strengths.append(f"Multi-dimensional sentiment analysis for {len(sentiment['restaurants'])} restaurants")
+            if isinstance(parsed_menus, list) and len(parsed_menus) >= 2:
+                strengths.append(f"Structured menus parsed for {len(parsed_menus)} restaurants")
+            if isinstance(keywords, dict) and keywords.get("positive_keywords"):
+                strengths.append("Review keyword frequency analysis completed")
+            if isinstance(strategy, dict) and strategy.get("pillars"):
+                strengths.append(f"Strategic recommendations with {len(strategy['pillars'])} pillars")
 
         return strengths if strengths else ["Research conducted with available data"]
 
@@ -349,12 +368,13 @@ Output your evaluation as JSON using the required schema."""
         researcher_output = state.get("researcher_output")
         if not researcher_output:
             raise ValueError("No researcher_output found in state")
-            
+
         user_query = state.get("user_query", "")
         planner_output = state.get("planner_output", {})
+        analyst_output = state.get("analyst_output")
 
         try:
-            output = self.evaluate(user_query, planner_output, researcher_output)
+            output = self.evaluate(user_query, planner_output, researcher_output, analyst_output)
 
             if output.decision == "ACCEPT":
                 next_node = "report"
@@ -371,7 +391,7 @@ Output your evaluation as JSON using the required schema."""
 
             return {
                 **state,
-                "critic_output": output.model_dump(),  # Convert Pydantic to dict for state
+                "critic_output": output.model_dump(),
                 "current_node": next_node,
             }
         except Exception as e:

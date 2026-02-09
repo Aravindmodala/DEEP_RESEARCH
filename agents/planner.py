@@ -21,7 +21,7 @@ from prompts import PLANNER_SYSTEM_PROMPT
 from utils import create_llm
 
 
-console = Console()
+console = Console(force_terminal=False)
 
 
 def create_planner_tavily_tool(api_key: str | None = None):
